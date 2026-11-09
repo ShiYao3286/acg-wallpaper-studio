@@ -110,6 +110,14 @@ async function changeNow() {
   } finally { btn.disabled = false; }
 }
 async function aiNow() {
+  // 无画图服务时引导到 API 服务页
+  const services = await api.listServices();
+  const hasImage = services.some(s => s.kind === 'image');
+  if (!hasImage) {
+    toast('请先到「API 服务」页添加画图 API(需支持 /v1/images/generations)', 5000);
+    document.querySelector('.nav-item[data-page="services"]').click();
+    return;
+  }
   const btn = $('btn-ai'); btn.disabled = true;
   toast('AI 正在生成,约 20~60 秒…', 60000);
   try {

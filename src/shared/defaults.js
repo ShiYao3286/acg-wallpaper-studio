@@ -11,18 +11,11 @@ const DEFAULT_CONFIG = {
     apiBase: 'https://api.lolicon.app/setu/v2',
   },
   // API 服务列表(kind: image=画图 / text=文本),id 由时间戳生成
-  services: [
-    {
-      id: 'svc-default-image',
-      name: '默认生图服务',
-      kind: 'image',
-      apiBase: 'https://nb.deepsb.com',
-      apiKey: 'sk-90ba7048131868b995685d881cab5740fc48778a9d05de0f31c553e515c2a7d1',
-      model: 'gpt-image-2.6',
-    },
-  ],
+  // API 服务列表:默认不含任何密钥,首次使用请在「API 服务」页添加
+  // kind: image=画图(/v1/images/generations) text=文本(/v1/chat/completions)
+  services: [],
   // 当前使用的服务 id(画图与文本分开记)
-  activeImageService: 'svc-default-image',
+  activeImageService: '',
   activeTextService: '',   // 空 = 未配置文本模型
   ai: {
     prompt: 'anime wallpaper, beautiful scenery, girl, detailed, high quality',
@@ -38,11 +31,11 @@ const DEFAULT_CONFIG = {
   schedule: { enabled: true, intervalMinutes: 30 },
   gameCheck: {
     enabled: true,
-    processes: ['WardogsClient-Win64-Shipping', 'WardogsLauncher-Shipping'],
+    processes: [],   // 示例: WardogsClient-Win64-Shipping
   },
   history: { keepCount: 30 },
   // 出网代理(访问 Lolicon / AI API 用):enabled=false 直连
-  proxy: { enabled: false, url: 'http://127.0.0.1:7897' },
+  proxy: { enabled: false, url: '' },   // 例: http://127.0.0.1:7897(Clash Verge)
   migrate: { oldTaskDisabled: false },
 };
 
