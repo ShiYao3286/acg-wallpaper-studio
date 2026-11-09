@@ -1,0 +1,51 @@
+{
+  "name": "acg-wallpaper-studio",
+  "version": "1.3.1",
+  "description": "ACG 壁纸工作室 - 随机二次元壁纸 + AI 生图壁纸管理工具",
+  "main": "src/main/main.js",
+  "author": "user",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "wallpaper": "^7.3.1"
+  },
+  "build": {
+    "appId": "com.acg.wallpaper-studio",
+    "productName": "ACG壁纸工作室",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ACG壁纸工作室",
+      "artifactName": "ACG壁纸工作室-Setup.${ext}"
+    },
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "artifactName": "ACG壁纸工作室-免安装.${ext}"
+  }
+}
