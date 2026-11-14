@@ -1,4 +1,5 @@
-// 渲染进程逻辑 v1.1
+// 渲染进程逻辑 v1.3.1
+// 版本号需与 package.json 保持一致，后续应由主进程注入
 const $ = id => document.getElementById(id);
 
 // ---------- 导航 ----------
@@ -20,6 +21,20 @@ function toast(msg, ms = 2600) {
   clearTimeout(t._tm); t._tm = setTimeout(() => t.style.display = 'none', ms);
 }
 function setSwitch(id, on) { const s = $(id); if (s) s.classList.toggle('on', !!on); }
+// 填充模型下拉/候选列表(DOM API,模型名来自远端 API,不可拼 HTML)
+// withValue=true 用于 datalist 候选(value 属性),false 用于 select 选项
+function fillModelOptions(targetId, models, withValue = true) {
+  const box = $(targetId);
+  if (!box) return;
+  box.textContent = '';
+  (models || []).forEach(m => {
+    const opt = document.createElement('option');
+    const name = String(m);
+    if (withValue) opt.value = name;
+    opt.textContent = withValue ? '' : name;
+    box.appendChild(opt);
+  });
+}
 
 // ---------- 配置 ----------
 async function loadConfig() {
@@ -82,10 +97,26 @@ async function toggleAutoRun(el) {
 
 // ---------- 标签池 ----------
 function renderTags(tags) {
-  $('tag-list').innerHTML = tags.map((t, i) =>
-    '<span class="tag-chip c' + (i % 6) + '">' + t +
-    '<span class="x" onclick="delTag(\'' + t.replace(/'/g, "\\'") + '\')">✕</span></span>'
-  ).join('') || '<p class="hint">标签池为空,换图时将不指定题材</p>';
+  const box = $('tag-list');
+  box.textContent = '';
+  if (!tags || !tags.length) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = '标签池为空,换图时将不指定题材';
+    box.appendChild(p);
+    return;
+  }
+  tags.forEach((t, i) => {
+    const chip = document.createElement('span');
+    chip.className = 'tag-chip c' + (i % 6);
+    chip.appendChild(document.createTextNode(t));
+    const x = document.createElement('span');
+    x.className = 'x';
+    x.textContent = '✕';
+    x.addEventListener('click', () => delTag(t));
+    chip.appendChild(x);
+    box.appendChild(chip);
+  });
 }
 async function addTag() {
   const v = $('tag-input').value.trim();
@@ -137,10 +168,24 @@ function openFolder() { api.openWallpaperDir(); }
 async function loadPresets() {
   const cfg = await api.getConfig();
   const list = cfg.promptPresets || [];
-  $('preset-list').innerHTML = list.map(p =>
-    '<span class="preset-slot" onclick="applyPreset(\'' + p.id + '\')"><svg><use href="#i-save"/></svg>' + p.name + '</span>'
-  ).join('') +
-  '<span class="preset-slot" onclick="saveAsPreset()" style="border-style:dashed"><svg><use href="#i-plus"/></svg>存当前为新预设</span>';
+  const box = $('preset-list');
+  box.textContent = '';
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const makeSlot = (label, iconId, onClick, dashed) => {
+    const slot = document.createElement('span');
+    slot.className = 'preset-slot';
+    if (dashed) slot.style.borderStyle = 'dashed';
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    const use = document.createElementNS(SVG_NS, 'use');
+    use.setAttribute('href', iconId);
+    svg.appendChild(use);
+    slot.appendChild(svg);
+    slot.appendChild(document.createTextNode(label));
+    slot.addEventListener('click', onClick);
+    return slot;
+  };
+  list.forEach(p => box.appendChild(makeSlot(p.name, '#i-save', () => applyPreset(p.id), false)));
+  box.appendChild(makeSlot('存当前为新预设', '#i-plus', () => saveAsPreset(), true));
 }
 async function applyPreset(id) {
   const cfg = await api.getConfig();
@@ -188,10 +233,6 @@ async function setRandomMode(mode) {
   initAiMode(mode);
   toast('已切换: ' + ({ any: '完全随机', portrait: '锁定人物', scenery: '锁定风景', custom: '自定义' }[mode]));
 }
-async function rollPreview() {
-  const r = await api.rollRandomPrompt(currentAiMode);
-  $('random-prompt-preview').textContent = r.prompt;
-}
 
 // ---------- 提示词助手 ----------
 async function refreshAssistEngine() {
@@ -212,25 +253,59 @@ async function runAssist() {
 }
 
 // ---------- 历史 / 收藏 ----------
+// 构建一张图片卡片(DOM API,避免把文件名拼进 HTML)
+function makeGalleryItem(file, opts = {}) {
+  const item = document.createElement('div');
+  item.className = 'gitem';
+  item.addEventListener('click', () => useHistory(file.name));
+  const img = document.createElement('img');
+  img.src = encodeURI('file:///' + String(file.path).replace(/\\/g, '/'));
+  item.appendChild(img);
+  if (opts.showName !== false) {
+    const name = document.createElement('div');
+    name.className = 'gname';
+    name.textContent = file.name;
+    item.appendChild(name);
+  }
+  if (opts.deletable) {
+    const del = document.createElement('button');
+    del.className = 'gdel';
+    del.title = '删除收藏';
+    del.addEventListener('click', (ev) => { ev.stopPropagation(); delFav(file.name); });
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', '#i-trash');
+    svg.appendChild(use);
+    del.appendChild(svg);
+    item.appendChild(del);
+  }
+  const act = document.createElement('button');
+  act.className = 'gact';
+  act.textContent = '设为壁纸';
+  act.addEventListener('click', (ev) => { ev.stopPropagation(); useHistory(file.name); });
+  item.appendChild(act);
+  return item;
+}
+function setEmptyTip(box, text) {
+  box.textContent = '';
+  const tip = document.createElement('div');
+  tip.className = 'empty-tip';
+  tip.textContent = text;
+  box.appendChild(tip);
+}
 async function loadHistory() {
   const files = await api.listHistory();
-  $('gallery').innerHTML = files.map(f =>
-    '<div class="gitem" onclick="useHistory(\'' + f.name + '\')">' +
-    '<img src="' + encodeURI('file:///' + f.path.replace(/\\/g, '/')) + '">' +
-    '<div class="gname">' + f.name + '</div>' +
-    '<button class="gact" onclick="event.stopPropagation();useHistory(\'' + f.name + '\')">设为壁纸</button>' +
-    '</div>'
-  ).join('') || '<div class="empty-tip">暂无历史壁纸,点「立即换一张」开始 ✨</div>';
+  const box = $('gallery');
+  box.textContent = '';
+  if (!files || !files.length) { setEmptyTip(box, '暂无历史壁纸,点「立即换一张」开始 ✨'); return; }
+  files.forEach(f => box.appendChild(makeGalleryItem(f)));
 }
 async function loadFavorites() {
   const files = await api.listFavorites();
-  $('fav-gallery').innerHTML = files.map(f =>
-    '<div class="gitem" onclick="useHistory(\'' + f.name + '\')">' +
-    '<img src="' + encodeURI('file:///' + f.path.replace(/\\/g, '/')) + '">' +
-    '<button class="gdel" title="删除收藏" onclick="event.stopPropagation();delFav(\'' + f.name + '\')"><svg><use href="#i-trash"/></svg></button>' +
-    '<button class="gact" onclick="event.stopPropagation();useHistory(\'' + f.name + '\')">设为壁纸</button>' +
-    '</div>'
-  ).join('') || '<div class="empty-tip">暂无收藏 ♥ 主页右上角心形按钮可收藏当前壁纸</div>';
+  const box = $('fav-gallery');
+  box.textContent = '';
+  if (!files || !files.length) { setEmptyTip(box, '暂无收藏 ♥ 主页右上角心形按钮可收藏当前壁纸'); return; }
+  files.forEach(f => box.appendChild(makeGalleryItem(f, { showName: false, deletable: true })));
 }
 async function delFav(name) {
   const r = await api.deleteFavorite(name);
@@ -247,25 +322,61 @@ let editingSvc = null;
 async function loadServices() {
   const services = await api.listServices();
   const cfg = await api.getConfig();
-  $('svc-list').innerHTML = services.map(s => {
-    const isActiveImg = s.id === cfg.activeImageService && s.kind === 'image';
-    const isActiveTxt = s.id === cfg.activeTextService && s.kind === 'text';
-    return '<div class="svc-card">' +
-      '<div class="svc-head">' +
-      '<span class="svc-kind ' + s.kind + '">' + (s.kind === 'image' ? '画图' : '文本') + '</span>' +
-      '<span class="svc-name">' + (s.name || '未命名') + '</span>' +
-      (isActiveImg || isActiveTxt ? '<span class="active-badge">使用中</span>' : '') +
-      '<span class="svc-model">' + (s.model || '') + '</span>' +
-      '<div class="svc-actions">' +
-      (s.kind === 'image'
-        ? '<button class="btn small ghost" onclick="setActive(\'image\',\'' + s.id + '\')">设为画图</button>'
-        : '<button class="btn small ghost" onclick="setActive(\'text\',\'' + s.id + '\')">设为文本</button>') +
-      '<button class="btn small ghost" onclick="editService(\'' + s.id + '\')">编辑</button>' +
-      '<button class="btn small ghost" onclick="deleteService(\'' + s.id + '\')">删除</button>' +
-      '</div></div>' +
-      '<div class="svc-test-result" id="svc-res-' + s.id + '">' + (s.apiBase || '') + '</div>' +
-      '</div>';
-  }).join('') || '<p class="hint">还没有服务,点下方添加。默认生图服务已预置。</p>';
+  const box = $('svc-list');
+  box.textContent = '';
+  if (!services || !services.length) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = '还没有服务,点下方添加。默认生图服务已预置。';
+    box.appendChild(p);
+  } else {
+    services.forEach(s => {
+      const isActiveImg = s.id === cfg.activeImageService && s.kind === 'image';
+      const isActiveTxt = s.id === cfg.activeTextService && s.kind === 'text';
+      const card = document.createElement('div');
+      card.className = 'svc-card';
+      const head = document.createElement('div');
+      head.className = 'svc-head';
+      const kindEl = document.createElement('span');
+      kindEl.className = 'svc-kind ' + s.kind;
+      kindEl.textContent = s.kind === 'image' ? '画图' : '文本';
+      head.appendChild(kindEl);
+      const nameEl = document.createElement('span');
+      nameEl.className = 'svc-name';
+      nameEl.textContent = s.name || '未命名';
+      head.appendChild(nameEl);
+      if (isActiveImg || isActiveTxt) {
+        const badge = document.createElement('span');
+        badge.className = 'active-badge';
+        badge.textContent = '使用中';
+        head.appendChild(badge);
+      }
+      const modelEl = document.createElement('span');
+      modelEl.className = 'svc-model';
+      modelEl.textContent = s.model || '';
+      head.appendChild(modelEl);
+      const actions = document.createElement('div');
+      actions.className = 'svc-actions';
+      const mkBtn = (label, onClick) => {
+        const b = document.createElement('button');
+        b.className = 'btn small ghost';
+        b.textContent = label;
+        b.addEventListener('click', onClick);
+        actions.appendChild(b);
+      };
+      mkBtn(s.kind === 'image' ? '设为画图' : '设为文本', () => setActive(s.kind, s.id));
+      mkBtn('编辑', () => editService(s.id));
+      mkBtn('删除', () => deleteService(s.id));
+      head.appendChild(actions);
+      card.appendChild(head);
+      const res = document.createElement('div');
+      res.className = 'svc-test-result';
+      res.id = 'svc-res-' + s.id;
+      res.textContent = s.apiBase || '';
+      card.appendChild(res);
+      box.appendChild(card);
+    });
+  }
   refreshAssistEngine();
 }
 function newService() {
@@ -323,7 +434,7 @@ async function fetchModels() {
   try {
     const r = await api.fetchModels(editingSvc);
     if (r.ok) {
-      $('svc-model-list').innerHTML = r.models.map(m => '<option value="' + m + '">').join('');
+      fillModelOptions('svc-model-list', r.models);
       $('svc-editor-result').textContent = '拉取到 ' + r.models.length + ' 个模型: ' + r.models.slice(0, 6).join(', ') + (r.models.length > 6 ? ' …' : '');
     } else {
       $('svc-editor-result').textContent = '拉取失败: ' + r.error;
@@ -349,7 +460,7 @@ async function refreshStatus() {
   // AI 页模型下拉:跟随当前画图服务的模型列表
   if (Array.isArray(st.imageModels) && st.imageModels.length) {
     const cur = $('ai-model').value;
-    $('ai-model').innerHTML = st.imageModels.map(m => '<option>' + m + '</option>').join('');
+    fillModelOptions('ai-model', st.imageModels, false);
     if (st.imageModels.includes(cur)) $('ai-model').value = cur;
   }
   if (st.currentPath) {
@@ -396,9 +507,12 @@ async function detectProxy() {
 
 // ---------- 旧脚本联动 ----------
 // 主进程监听到壁纸目录文件变化(旧脚本换图/归档)时推送此事件
-api.onUiRefresh(async () => {
+api.onUiRefresh(async (reason) => {
   await refreshStatus();
-  toast('检测到旧脚本更换了壁纸,已同步', 2200);
+  // 只有真正来自外部(旧脚本等)的写入才提示,本程序自身写入不打扰用户
+  if (reason === 'external') {
+    toast('检测到旧脚本更换了壁纸,已同步', 2200);
+  }
 });
 
 // 设置页旧任务徽章

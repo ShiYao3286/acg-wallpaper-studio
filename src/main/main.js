@@ -20,6 +20,36 @@ async function setWallpaper(p) {
   await wpModule.setWallpaper(p);
 }
 
+// ---------- 模型列表缓存(避免 get-status 同步等待网络) ----------
+let modelsCache = { key: '', models: [] };
+let modelsRefreshing = false;
+const imgSvcKey = (svc) => svc.id + '|' + apiBase(svc.apiBase);
+function refreshImageModels(svc) {
+  if (!svc || modelsRefreshing) return;
+  const key = imgSvcKey(svc);
+  if (modelsCache.key === key) return;
+  modelsRefreshing = true;
+  fetchServiceModels(svc).then((models) => {
+    modelsCache = { key, models };
+    notifyUiRefresh('models');
+  }).catch(() => {}).finally(() => { modelsRefreshing = false; });
+}
+
+// ---------- 自身写入标记(区分本程序写入与旧脚本写入) ----------
+const SELF_WRITE_WINDOW = 5000; // 5 秒:覆盖 setWallpaper 等异步调用的耗时
+let selfWriteAt = 0;
+const markSelfWrite = () => { selfWriteAt = Date.now(); };
+
+// ---------- 换图互斥锁(任务结束后释放,避免并发操作) ----------
+function acquireChanging() {
+  if (changing) return false;
+  changing = true;
+  return true;
+}
+function releaseChanging() {
+  changing = false;
+}
+
 // ---------- 配置存取 ----------
 const confDir = () => path.join(app.getPath('userData'), 'config');
 const confFile = () => path.join(confDir(), 'config.json');
@@ -32,8 +62,10 @@ async function loadConfig() {
     return structuredClone(DEFAULT_CONFIG);
   }
 }
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 function deepMerge(base, over) {
   for (const k of Object.keys(over)) {
+    if (FORBIDDEN_KEYS.has(k)) continue; // 防原型污染
     if (over[k] && typeof over[k] === 'object' && !Array.isArray(over[k]) && base[k] && typeof base[k] === 'object') {
       deepMerge(base[k], over[k]);
     } else base[k] = over[k];
@@ -151,8 +183,12 @@ async function fetchAI(cfg, serviceId, finalPrompt) {
 
 // ---------- 核心: 换壁纸流程 ----------
 async function changeWallpaper(reason = 'schedule') {
-  if (changing) return { ok: false, error: '正在换图中,请稍候' };
-  changing = true;
+  if (!acquireChanging()) return { ok: false, error: '正在换图中,请稍候' };
+  // 事务上下文:必须在进入流程前快照,"调用前 current 是否存在"是回滚的判据
+  // 注意:不能在归档分支里才赋值——若在归档前就失败(如下载超时),hadCurrent 会保持初始值,
+  // 回滚将误判为"原本无壁纸"并删除用户的 current.jpg
+  const tx = { hadCurrent: fs.existsSync(currentPath()), archivedHist: null, touchedCurrent: false };
+  const tmp = path.join(wallDir(), 'current.tmp.jpg');
   try {
     const cfg = await loadConfig();
     const game = await gameRunning(cfg);
@@ -163,7 +199,6 @@ async function changeWallpaper(reason = 'schedule') {
     await ensureDir();
 
     // 1. 获取图片到临时文件
-    const tmp = path.join(wallDir(), 'current.tmp.jpg');
     let buf, meta = {};
     if (reason === 'ai' || cfg.source === 'ai') {
       // 随机模式: any/portrait/scenery 每次现拼提示词;custom 用用户保存的
@@ -184,33 +219,41 @@ async function changeWallpaper(reason = 'schedule') {
       buf = Buffer.from(await r.arrayBuffer());
     }
     if (!buf || buf.length < 10240) throw new Error('下载的图片无效或过小');
+    markSelfWrite();
     await fsp.writeFile(tmp, buf);
 
-    // 2. 旧图归档
-    try {
-      if (fs.existsSync(currentPath())) {
-        await fsp.rename(currentPath(), path.join(wallDir(), 'hist_' + ts() + '.jpg'));
-      }
-    } catch {}
+    // 2. 旧图归档 —— 归档是回滚的唯一凭据,失败必须中断,不能静默继续
+    //    (若归档失败仍继续 rename,旧图会被直接覆盖且无法恢复)
+    markSelfWrite();
+    if (fs.existsSync(currentPath())) {
+      tx.archivedHist = await archiveCurrent();
+    }
+
+    // 3. 临时文件转为正式壁纸
+    //    touchedCurrent 在改动磁盘前置位,保证失败路径能被回滚识别
+    tx.touchedCurrent = true;
+    markSelfWrite();
     await fsp.rename(tmp, currentPath());
 
-    // 3. 清理历史
-    await pruneHistory(cfg);
-
-    // 4. 设壁纸
+    // 4. 设为系统壁纸 —— 失败需回滚文件,否则磁盘是新图而桌面是旧图
     await setWallpaper(currentPath());
+
+    // 5. 确认切换成功后才清理历史,避免回滚所需的归档被提前删除
+    await pruneHistory(cfg);
 
     // 追加元数据记录(JSONL,按文件名可回查)
     try {
       const record = { file: 'current.jpg', time: new Date().toISOString(), source: meta.source || 'lolicon',
         title: meta.title || '', author: meta.author || '', pid: meta.pid || '', tag: meta.tag || '',
         prompt: meta.prompt || '', bytes: buf.length };
+      markSelfWrite();
       await fsp.appendFile(path.join(wallDir(), 'history.jsonl'), JSON.stringify(record) + '\n', 'utf8');
       // 同步写回执(与旧脚本同一文件、同一格式),UI 通过 watcher 感知
       const receipt = { time: nowStr(), source: 'app', tag: meta.tag || '',
         title: meta.title || '', author: meta.author || '', pid: meta.pid || '',
         file: 'current.jpg', bytes: buf.length, prompt: meta.prompt || '',
         randomMode: meta.randomMode || '' };
+      markSelfWrite();
       await fsp.writeFile(path.join(wallDir(), 'wallpaper_meta.json'), JSON.stringify(receipt, null, 2), 'utf8');
     } catch {}
 
@@ -219,12 +262,157 @@ async function changeWallpaper(reason = 'schedule') {
     lastRun = { time: nowStr(), ok: true };
     return { ok: true, ...meta };
   } catch (e) {
-    lastRun = { time: nowStr(), ok: false, detail: e.message };
-    return { ok: false, error: e.message };
+    // 任一步失败:先清理临时文件,再回滚到调用前状态,保留原始错误
+    try { if (fs.existsSync(tmp)) await fsp.unlink(tmp); } catch {}
+    const rollbackErrs = await rollbackWallpaper(tx);
+    return buildFailureResult(e, rollbackErrs);
   } finally {
-    changing = false;
-    if (tray) buildTrayMenu();
+    releaseChanging();
   }
+}
+
+// 归档当前壁纸为 hist_<时间戳>.jpg,并把归档名回写到 history.jsonl 末条记录
+// (旧格式只多一个可选字段 histFile,不影响旧脚本读取)
+// 返回归档文件名;current 不存在时返回 null
+// 注意:调用前是否已有 current 由调用方的事务上下文(tx.hadCurrent)记录,
+//      本函数不承担该语义,避免两套 hadCurrent 混淆
+// rename 失败会抛出,由调用方决定中断或回滚;history.jsonl 回写失败仅吞错,不影响归档本身
+async function archiveCurrent() {
+  if (!fs.existsSync(currentPath())) return null;
+  const histName = 'hist_' + ts() + '.jpg';
+  await fsp.rename(currentPath(), path.join(wallDir(), histName));
+  try {
+    const f = path.join(wallDir(), 'history.jsonl');
+    const raw = await fsp.readFile(f, 'utf8');
+    const rows = raw.trimEnd().split('\n');
+    if (!rows.length) return histName;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      try {
+        const rec = JSON.parse(rows[i]);
+        if (rec && rec.file === 'current.jpg') {
+          rec.histFile = histName;
+          rows[i] = JSON.stringify(rec);
+          await fsp.writeFile(f, rows.join('\n') + '\n', 'utf8');
+          break;
+        }
+      } catch {}
+    }
+  } catch {}
+  return histName;
+}
+
+// ---------- 启动自愈:修复事务中断留下的状态 ----------
+// 场景:换图事务在"已归档旧图、尚未写回 current"之间被强杀(断电/任务管理器结束进程)
+//      结果是 current.jpg 消失,旧图只剩在 hist_<ts>.jpg 里,桌面壁纸还能显示但图库丢失当前项
+// 判据(必须同时满足,避免误判):
+//   1. current.jpg 不存在
+//   2. history.jsonl 末条 current 记录带 histFile,且该文件确实存在
+//      (histFile 是归档时回写的关联字段;只有走完 archiveCurrent 才会写入)
+//   3. 该 histFile 不是更早的归档(必须是最末条记录,证明是"刚被归档还没来得及替换")
+// 处理:把 histFile 复制回 current.jpg(保留 hist,与回滚策略一致,避免 histFile 引用悬空)
+// 不做:不删除任何文件,不改动 history.jsonl,不设置系统壁纸(交给 UI 常规刷新)
+async function healInterruptedTransaction() {
+  try {
+    const cur = currentPath();
+    if (fs.existsSync(cur)) return null;      // 正常:current 存在,无需处理
+
+    const histDir = wallDir();
+    if (!fs.existsSync(histDir)) return null;
+
+    // 读 history.jsonl 末条 current 记录
+    let last = null;
+    try {
+      const raw = await fsp.readFile(path.join(histDir, 'history.jsonl'), 'utf8');
+      const rows = raw.trimEnd().split('\n');
+      for (let i = rows.length - 1; i >= 0; i--) {
+        try {
+          const rec = JSON.parse(rows[i]);
+          if (rec && rec.file === 'current.jpg') { last = rec; break; }
+        } catch {}
+      }
+    } catch { return null; }
+
+    // 末条记录没有 histFile,说明上次换图是正常完成的(或从未归档),不是中断
+    if (!last || !last.histFile) return null;
+
+    const histPath = path.join(histDir, last.histFile);
+    if (!fs.existsSync(histPath)) {
+      // 有关联字段但文件没了:可能是被 pruneHistory 清理,属于正常历史淘汰,不恢复
+      return null;
+    }
+
+    // 确认是本次中断留下的归档,复制回 current
+    markSelfWrite();
+    await fsp.copyFile(histPath, cur);
+    const msg = '检测到上次换图中断,已从 ' + last.histFile + ' 恢复 current.jpg';
+    lastInfo = msg + ' (' + nowStr() + ')';
+    if (win && !win.isDestroyed()) {
+      try { win.webContents.send('ui-refresh', 'external'); } catch {}
+    }
+    return { recovered: true, from: last.histFile, message: msg };
+  } catch (e) {
+    return { recovered: false, error: e.message };
+  }
+}
+
+// ---------- 换壁纸事务:失败回滚 ----------
+// 事务上下文:
+//   hadCurrent    调用前 current.jpg 是否存在
+//   archivedHist  归档产生的 hist 文件名(回滚来源);为空表示本次未归档
+// 回滚策略(按优先级):
+//   1. 有归档 -> 用 copyFile 从 hist 复制回 current(保留 hist 文件,避免 history.jsonl 的 histFile 引用失效)
+//      - 不能用 rename:会让刚回写的 histFile 变成悬空引用
+//   2. 原本无 current 且归档也没产生 -> 删除本次生成的新 current,恢复"无壁纸"状态
+//   3. 回滚后尝试重新设置系统壁纸;重设失败只记录,不覆盖原始错误
+// 回滚自身的错误全部收集返回,由调用方决定如何呈现,绝不静默丢弃原始错误。
+async function rollbackWallpaper(tx) {
+  const errs = [];
+  const cur = currentPath();
+  try {
+    if (tx.archivedHist) {
+      // 情况 A:本次归档过旧图,从归档恢复
+      const histPath = path.join(wallDir(), tx.archivedHist);
+      if (fs.existsSync(histPath)) {
+        markSelfWrite();
+        await fsp.copyFile(histPath, cur);
+      } else {
+        errs.push('归档文件不存在,无法恢复: ' + tx.archivedHist);
+      }
+    } else if (!tx.hadCurrent && tx.touchedCurrent) {
+      // 情况 B:调用前没有壁纸,且本流程确实写过 current -> 清理,恢复"无壁纸"状态
+      // 必须同时满足 touchedCurrent:若流程在写 current 之前就失败(如下载超时),
+      // 磁盘上的 current 与本次操作无关,绝不能删除
+      if (fs.existsSync(cur)) {
+        markSelfWrite();
+        await fsp.unlink(cur).catch((e) => { errs.push('清理 current 失败: ' + e.message); });
+      }
+    }
+    // 情况 C:未归档也未写过 current(如下载失败)-> 磁盘无变化,无需回滚
+    // 恢复系统桌面壁纸(仅当磁盘上确实有 current 时才有意义)
+    if (fs.existsSync(cur)) {
+      try {
+        await setWallpaper(cur);
+      } catch (e) {
+        errs.push('恢复系统壁纸失败: ' + e.message);
+      }
+    }
+  } catch (e) {
+    errs.push('回滚过程异常: ' + e.message);
+  }
+  return errs;
+}
+
+// 组装带回滚信息的错误结果:原始错误优先,回滚错误附加说明
+function buildFailureResult(originalErr, rollbackErrs) {
+  const base = originalErr && originalErr.message ? originalErr.message : String(originalErr);
+  lastRun = { time: nowStr(), ok: false, detail: base + (rollbackErrs.length ? ' | 回滚异常' : '') };
+  if (!rollbackErrs.length) return { ok: false, error: base };
+  return {
+    ok: false,
+    error: base + ' (回滚也出现问题: ' + rollbackErrs.join('; ') + ')',
+    originalError: base,
+    rollbackErrors: rollbackErrs,
+  };
 }
 
 async function pruneHistory(cfg) {
@@ -232,6 +420,7 @@ async function pruneHistory(cfg) {
     const files = (await fsp.readdir(wallDir())).filter(f => f.startsWith('hist_') && f.endsWith('.jpg'))
       .sort().reverse();
     const keep = cfg.history.keepCount || 30;
+    if (files.length > keep) markSelfWrite();
     for (const f of files.slice(keep)) {
       await fsp.unlink(path.join(wallDir(), f)).catch(() => {});
     }
@@ -256,9 +445,11 @@ function startWatcher() {
   try {
     wallWatcher = fs.watch(wallDir(), { persistent: false }, (event, filename) => {
       if (!filename || /^current\.(jpg|tmp\.jpg)$|^hist_.*\.jpg$|^wallpaper_meta\.json$/.test(filename)) {
+        // 区分来源:自身写入窗口内视为 self,否则视为旧脚本等外部写入
+        const isSelf = (Date.now() - selfWriteAt) < SELF_WRITE_WINDOW;
         // 防抖:下载/归档会触发多次事件,500ms 合并成一次刷新
         clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => notifyUiRefresh('fs-event'), 500);
+        debounceTimer = setTimeout(() => notifyUiRefresh(isSelf ? 'self' : 'external'), 500);
       }
     });
     wallWatcher.on('error', () => {}); // 目录暂不存在时静默,ensureDir 后重试
@@ -323,10 +514,14 @@ const ts = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); re
 
 // ---------- IPC ----------
 ipcMain.handle('get-config', () => loadConfig());
+const CONFIG_TOP_KEYS = new Set(Object.keys(DEFAULT_CONFIG));
 ipcMain.handle('save-config', (e, key, val) => {
-  // key 支持 a.b.c 点路径
-  const patch = {}; let cur = patch;
+  // key 支持 a.b.c 点路径;顶层键必须在默认配置白名单内,并拦截原型污染键
+  if (typeof key !== 'string' || !key) return { ok: false, error: '无效的配置键' };
   const parts = key.split('.');
+  if (parts.some(x => FORBIDDEN_KEYS.has(x))) return { ok: false, error: '非法配置键' };
+  if (!CONFIG_TOP_KEYS.has(parts[0])) return { ok: false, error: '不允许的配置键: ' + parts[0] };
+  const patch = {}; let cur = patch;
   parts.forEach((p, i) => { if (i === parts.length - 1) cur[p] = val; else cur = cur[p] = {}; });
   return saveConfig(patch);
 });
@@ -338,13 +533,99 @@ ipcMain.handle('list-history', async () => {
   } catch { return []; }
 });
 ipcMain.handle('use-history', async (e, name) => {
+  if (!acquireChanging()) return { ok: false, error: '正在换图中,请稍候' };
+  // 事务上下文:进入流程前先快照,"调用前 current 是否存在"是回滚判据
+  const tx = { hadCurrent: fs.existsSync(currentPath()), archivedHist: null, touchedCurrent: false };
   try {
     const safe = path.basename(name);
-    const src = path.join(wallDir(), safe);
+    const historyPath = path.join(wallDir(), safe);
+    const favoritePath = path.join(wallDir(), 'favorites', safe);
+    const isFavorite = !fs.existsSync(historyPath) && fs.existsSync(favoritePath);
+    const src = isFavorite ? favoritePath : historyPath;
     if (!fs.existsSync(src)) return { ok: false, error: '文件不存在' };
-    await setWallpaper(src);
+
+    await ensureDir();
+    markSelfWrite();
+
+    // 1. 来源若已是当前壁纸,直接应用,不重复归档
+    if (path.resolve(src) === path.resolve(currentPath())) {
+      await setWallpaper(currentPath());
+      return { ok: true, current: true };
+    }
+
+    // 2. 先读出来源图片内容(历史图保持原样,不删除)
+    const buf = await fsp.readFile(src);
+
+    // 3. 归档当前壁纸;若内容与来源相同则跳过,避免重复归档同一张图
+    //    归档是回滚的唯一凭据,失败必须中断
+    if (fs.existsSync(currentPath())) {
+      const curBuf = await fsp.readFile(currentPath());
+      if (curBuf.length === buf.length && curBuf.equals(buf)) {
+        // 内容相同:不归档,current 保持原样
+      } else {
+        tx.archivedHist = await archiveCurrent();
+      }
+    }
+
+    // 4. 写入 current.jpg
+    //    touchedCurrent 必须在写入"之前"置位:writeFile 可能中途失败留下半成品,
+    //    若写在成功之后,失败路径会漏掉清理
+    tx.touchedCurrent = true;
+    markSelfWrite();
+    await fsp.writeFile(currentPath(), buf);
+
+    // 5. 设壁纸 —— 失败需回滚文件
+    await setWallpaper(currentPath());
+
+    // 6. 同步历史记录与回执(与 changeWallpaper 同一格式)
+    try {
+      // 查找来源元数据:
+      //   历史图 -> 按 histFile 精确匹配;老数据没有 histFile 时退化为按字节数匹配
+      //   收藏图 -> 收藏时未存元数据,退化为按字节数匹配最近一条记录
+      let meta = null;
+      try {
+        const raw = await fsp.readFile(path.join(wallDir(), 'history.jsonl'), 'utf8');
+        const parts = raw.trim().split('\n');
+        const parsed = [];
+        for (const l of parts) { try { const r = JSON.parse(l); if (r) parsed.push(r); } catch {} }
+        if (!isFavorite) {
+          for (let i = parsed.length - 1; i >= 0; i--) {
+            if (parsed[i].histFile === safe) { meta = parsed[i]; break; }
+          }
+        }
+        if (!meta) {
+          for (let i = parsed.length - 1; i >= 0; i--) {
+            if (parsed[i].bytes === buf.length) { meta = parsed[i]; break; }
+          }
+        }
+      } catch {}
+      const record = {
+        file: 'current.jpg', time: new Date().toISOString(),
+        source: meta?.source || (isFavorite ? 'favorite' : 'history'),
+        title: meta?.title || '', author: meta?.author || '', pid: meta?.pid || '',
+        tag: meta?.tag || '', prompt: meta?.prompt || '', bytes: buf.length,
+      };
+      markSelfWrite();
+      await fsp.appendFile(path.join(wallDir(), 'history.jsonl'), JSON.stringify(record) + '\n', 'utf8');
+      const receipt = { time: nowStr(), source: 'app', tag: record.tag, title: record.title,
+        author: record.author, pid: record.pid, file: 'current.jpg', bytes: buf.length,
+        prompt: record.prompt, randomMode: '' };
+      markSelfWrite();
+      await fsp.writeFile(path.join(wallDir(), 'wallpaper_meta.json'), JSON.stringify(receipt, null, 2), 'utf8');
+    } catch {}
+
+    lastInfo = ('已应用' + (isFavorite ? '收藏' : '历史') + '壁纸') + ' · ' + (buf.length / 1024).toFixed(0) + 'KB · ' + nowStr();
+    lastRun = { time: nowStr(), ok: true };
     return { ok: true };
-  } catch (err) { return { ok: false, error: err.message }; }
+  } catch (err) {
+    // 任一步失败:回滚到调用前状态,并保留原始错误
+    // 注意:回滚目标是"调用前的 current.jpg",绝不是用户选择的历史/收藏源文件
+    const rollbackErrs = await rollbackWallpaper(tx);
+    return buildFailureResult(err, rollbackErrs);
+  } finally {
+    releaseChanging();
+    if (tray) buildTrayMenu();
+  }
 });
 ipcMain.handle('get-status', async () => {
   const cfg = await loadConfig();
@@ -356,12 +637,18 @@ ipcMain.handle('get-status', async () => {
   try { if (fs.existsSync(currentPath())) currentPathStr = currentPath(); } catch {}
   const imgSvc = findService(cfg, cfg.activeImageService);
   const meta = await readWallpaperMeta();
+  // 模型列表走缓存,后台异步刷新;本函数不等待网络
+  let imageModels = [];
+  if (imgSvc) {
+    if (modelsCache.key === imgSvcKey(imgSvc)) imageModels = modelsCache.models;
+    else refreshImageModels(imgSvc);
+  }
   return {
     lastInfo, nextRun, currentPath: currentPathStr,
     sourceLabel: cfg.source === 'ai'
       ? ('当前来源: AI 生图 (' + (imgSvc?.name || '未配置') + ')')
       : '当前来源: Lolicon 随机二次元',
-    imageModels: imgSvc ? await fetchServiceModels(imgSvc).catch(() => []) : [],
+    imageModels,
     // 旧脚本回执与旧任务状态
     scriptMeta: meta,
     oldTaskRunning: !(cfg.migrate && cfg.migrate.oldTaskDisabled),
@@ -545,6 +832,7 @@ ipcMain.handle('favorite-current', async () => {
     if (!fs.existsSync(currentPath())) return { ok: false, error: '当前没有壁纸' };
     const favDir = path.join(wallDir(), 'favorites');
     await fsp.mkdir(favDir, { recursive: true });
+    markSelfWrite();
     const dest = path.join(favDir, 'fav_' + ts() + '.jpg');
     await fsp.copyFile(currentPath(), dest);
     return { ok: true, file: dest };
@@ -603,6 +891,12 @@ app.whenReady().then(async () => {
   buildTrayMenu();
   applySchedule(await loadConfig());
   await ensureDir();
+  // 启动自愈:修复上次异常退出(断电/强杀)遗留的 current 缺失
+  // 必须在 startWatcher 之前,避免自愈写入触发"旧脚本换图"误报
+  const healed = await healInterruptedTransaction();
+  if (healed && healed.recovered) {
+    buildTrayMenu(); // 刷新托盘 tooltip
+  }
   startWatcher();
 });
 

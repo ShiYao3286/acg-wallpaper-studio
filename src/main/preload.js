@@ -32,7 +32,12 @@ contextBridge.exposeInMainWorld('api', {
   detectProxy: () => ipcRenderer.invoke('detect-proxy'),
   rollRandomPrompt: (mode) => ipcRenderer.invoke('roll-random-prompt', mode),
   // 主进程推送(旧脚本换图等文件事件)
-  onUiRefresh: (cb) => ipcRenderer.on('ui-refresh', () => cb()),
+  // 返回取消订阅函数;回调收到 reason('self' 本程序写入 / 'external' 旧脚本等外部写入 / 'models' 模型缓存更新)
+  onUiRefresh: (cb) => {
+    const handler = (_e, reason) => cb(reason);
+    ipcRenderer.on('ui-refresh', handler);
+    return () => ipcRenderer.removeListener('ui-refresh', handler);
+  },
   queryOldTask: () => ipcRenderer.invoke('query-old-task'),
   win: {
     minimize: () => ipcRenderer.invoke('win-minimize'),
