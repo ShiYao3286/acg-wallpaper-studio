@@ -61,17 +61,34 @@ async function loadConfig() {
   refreshAssistEngine();
   refreshStatus();
 }
-async function saveStr(key, val) { await api.saveConfig(key, String(val)); toast('已保存'); }
-async function saveNum(key, val) { await api.saveConfig(key, parseInt(val) || 0); toast('已保存'); }
+// 配置保存失败必须让用户看见:原实现丢弃 saveConfig 返回值,落盘失败也照弹"已保存"
+async function saveStr(key, val) {
+  const r = await api.saveConfig(key, String(val));
+  if (r && r.ok === false) { toast('保存失败: ' + (r.error || '未知错误'), 4000); return; }
+  toast('已保存');
+}
+async function saveNum(key, val) {
+  const r = await api.saveConfig(key, parseInt(val) || 0);
+  if (r && r.ok === false) { toast('保存失败: ' + (r.error || '未知错误'), 4000); return; }
+  toast('已保存');
+}
 async function toggleSwitch(el, key) {
   el.classList.toggle('on');
-  await api.saveConfig(key, el.classList.contains('on'));
+  const on = el.classList.contains('on');
+  const r = await api.saveConfig(key, on);
+  if (r && r.ok === false) {
+    // 落盘失败时把开关拨回原状,避免界面状态与磁盘状态不一致
+    el.classList.toggle('on', !on);
+    toast('保存失败: ' + (r.error || '未知错误'), 4000);
+    return;
+  }
   toast('已保存');
 }
 async function setSource(src) {
   $('seg-lolicon').classList.toggle('on', src !== 'ai');
   $('seg-ai').classList.toggle('on', src === 'ai');
-  await api.saveConfig('source', src);
+  const r = await api.saveConfig('source', src);
+  if (r && r.ok === false) { toast('切换失败: ' + (r.error || '未知错误'), 4000); return; }
   toast('壁纸来源已切换: ' + (src === 'ai' ? 'AI 生图' : 'Lolicon 二次元图'));
   refreshStatus();
 }
@@ -135,7 +152,7 @@ async function changeNow() {
   const btn = $('btn-change'); btn.disabled = true;
   try {
     const r = await api.changeWallpaper('manual');
-    if (r.ok) toast('换图成功: ' + (r.title || ''), 4000);
+    if (r.ok) toast('换图成功: ' + (r.title || '') + (r.historyWriteError ? '(历史记录未写入: ' + r.historyWriteError + ')' : ''), 4000);
     else toast('换图失败: ' + r.error, 5000);
     refreshStatus();
   } finally { btn.disabled = false; }
@@ -153,7 +170,7 @@ async function aiNow() {
   toast('AI 正在生成,约 20~60 秒…', 60000);
   try {
     const r = await api.changeWallpaper('ai');
-    if (r.ok) toast('AI 壁纸已应用!', 4000);
+    if (r.ok) toast('AI 壁纸已应用!' + (r.historyWriteError ? '(历史记录未写入: ' + r.historyWriteError + ')' : ''), 4000);
     else toast('生成失败: ' + r.error, 5000);
     refreshStatus();
   } finally { btn.disabled = false; }
@@ -198,7 +215,8 @@ async function applyPreset(id) {
 async function saveAsPreset() {
   const name = prompt('预设名称:', '新预设');
   if (!name) return;
-  await api.savePreset({ id: 'preset-' + Date.now(), name, prompt: $('ai-prompt').value });
+  const r = await api.savePreset({ id: 'preset-' + Date.now(), name, prompt: $('ai-prompt').value });
+  if (!r || r.ok === false) { toast('预设保存失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
   loadPresets();
   toast('预设已保存');
 }
@@ -314,7 +332,12 @@ async function delFav(name) {
 }
 async function useHistory(name) {
   const r = await api.useHistory(name);
-  toast(r.ok ? '已设为壁纸' : '失败: ' + r.error);
+  // 换图成功但历史/回执落盘失败时必须让用户看见,否则"已设为壁纸"会掩盖数据未记录的事实
+  if (r.ok) {
+    toast('已设为壁纸' + (r.historyWriteError ? '(历史记录未写入: ' + r.historyWriteError + ')' : ''), 4000);
+  } else {
+    toast('失败: ' + r.error);
+  }
 }
 
 // ---------- API 服务 ----------
@@ -408,19 +431,22 @@ async function saveService() {
   editingSvc.apiKey = $('svc-key').value.trim();
   editingSvc.model = $('svc-model').value.trim();
   if (!editingSvc.apiBase) { toast('API 地址不能为空'); return; }
-  await api.saveService(editingSvc);
+  const r = await api.saveService(editingSvc);
+  if (!r || r.ok === false) { toast('保存失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
   closeEditor();
   loadServices();
   toast('服务已保存');
 }
 async function deleteService(id) {
   if (!confirm('确定删除该服务?')) return;
-  await api.deleteService(id);
+  const r = await api.deleteService(id);
+  if (!r || r.ok === false) { toast('删除失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
   loadServices();
   toast('已删除');
 }
 async function setActive(kind, id) {
-  await api.setActiveService(kind, id);
+  const r = await api.setActiveService(kind, id);
+  if (!r || r.ok === false) { toast('切换失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
   loadServices();
   toast(kind === 'image' ? '已设为画图服务' : '已设为提示词助手引擎');
 }
@@ -463,6 +489,8 @@ async function refreshStatus() {
     fillModelOptions('ai-model', st.imageModels, false);
     if (st.imageModels.includes(cur)) $('ai-model').value = cur;
   }
+  // 模型列表拉取失败不再静默:明确告诉用户失败了、原因是什么,而不是留一个空下拉框让人猜
+  const modelsErrTip = st.imageModelsError ? ('模型列表获取失败: ' + st.imageModelsError) : '';
   if (st.currentPath) {
     $('preview').src = encodeURI('file:///' + st.currentPath.replace(/\\/g, '/')) + '?t=' + Date.now();
   }
@@ -488,7 +516,7 @@ async function refreshStatus() {
     }
   }
   $('status-text').textContent = st.sourceLabel + (meta && meta.time ? ' · 上次动作: ' + (meta.source === 'script' ? '旧脚本' : '软件') + ' ' + meta.time : (st.lastInfo ? ' · 上次: ' + st.lastInfo : ''));
-  $('status-right').textContent = (st.oldTaskRunning ? '旧任务运行中 · ' : '') + (st.nextRun ? '下次自动换图 ' + st.nextRun : '自动换图已关闭');
+  $('status-right').textContent = (modelsErrTip ? modelsErrTip + ' · ' : '') + (st.oldTaskRunning ? '旧任务运行中 · ' : '') + (st.nextRun ? '下次自动换图 ' + st.nextRun : '自动换图已关闭');
 }
 
 // ---------- 代理探测 ----------
@@ -508,7 +536,12 @@ async function detectProxy() {
 // ---------- 旧脚本联动 ----------
 // 主进程监听到壁纸目录文件变化(旧脚本换图/归档)时推送此事件
 api.onUiRefresh(async (reason) => {
-  await refreshStatus();
+  // 主进程推送时若 get-status 抛错,不 catch 会产生 unhandled rejection
+  try {
+    await refreshStatus();
+  } catch (e) {
+    $('status-text').textContent = '状态刷新失败: ' + ((e && e.message) || e);
+  }
   // 只有真正来自外部(旧脚本等)的写入才提示,本程序自身写入不打扰用户
   if (reason === 'external') {
     toast('检测到旧脚本更换了壁纸,已同步', 2200);
