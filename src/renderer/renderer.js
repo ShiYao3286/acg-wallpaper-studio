@@ -11,7 +11,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     $('page-' + el.dataset.page).classList.add('active');
     if (el.dataset.page === 'history') loadHistory();
     if (el.dataset.page === 'favorites') loadFavorites();
-    if (el.dataset.page === 'services') loadServices();
+    if (el.dataset.page === 'services') { loadServices(); refreshDoubao(); }
     if (el.dataset.page === 'ai') loadPresets();
   });
 });
@@ -47,6 +47,15 @@ const CLICK_ACTIONS = {
   'set-mode': (el) => setRandomMode(el.dataset.mode),
   'step-interval': (el) => stepInterval(Number(el.dataset.delta)),
   'roll-preview': (el) => rollPreview(el),
+  // 阶段3 豆包
+  'doubao-login': () => doubaoLogin(),
+  'doubao-relogin': () => doubaoLogin(),
+  'doubao-cancel-login': () => api.doubao.cancelLogin().then(() => refreshDoubao()).catch(() => {}),
+  'doubao-logout': () => doubaoLogout(),
+  'doubao-accept-risk': () => doubaoAcceptRisk(),
+  'doubao-decline-risk': () => doubaoDeclineRisk(),
+  'doubao-test-text': () => doubaoTestText(),
+  'doubao-test-image': () => doubaoTestImage(),
 };
 
 // change 类:key 来自 data-key,值来自元素自身
@@ -80,6 +89,175 @@ document.addEventListener('change', (ev) => {
   }
   fn(el);
 });
+
+// ---------- 豆包账号(阶段3 3.6) ----------
+//
+// 渲染层只拿状态字符串与时间戳。Cookie 永远不出主进程。
+// 状态区分刻意做细:未登录/登录中/已登录/需重新登录/服务端限制/协议异常,
+// 不用一个"已连接"掩盖所有问题。
+
+let doubaoRiskAccepted = false;
+let doubaoState = null;
+
+// 状态 → 人话 + 颜色。
+function doubaoStateText(st) {
+  if (!st) return { text: '正在读取状态…', color: '' };
+  switch (st.state) {
+    case 'idle':
+      return { text: '未登录。点击「扫码登录豆包」开始。', color: '' };
+    case 'opening':
+      return { text: '正在打开登录窗口…', color: '' };
+    case 'awaiting_scan':
+      return { text: '等待扫码中…请在豆包窗口里完成登录(5 分钟内有效)', color: '' };
+    case 'authenticated':
+      return { text: '已登录' + (st.savedAt ? '(' + new Date(st.savedAt).toLocaleString('zh-CN', { hour12: false }) + ' 登录)' : ''), color: '#4ade80' };
+    case 'expired':
+      return { text: '登录已过期,需要重新扫码登录。' + (st.lastError || ''), color: '#fbbf24' };
+    case 'cancelled':
+      return { text: '已取消登录。', color: '' };
+    case 'error':
+      return { text: '登录出错: ' + (st.lastError || '未知原因'), color: '#f87171' };
+    default:
+      return { text: '状态未知: ' + st.state, color: '' };
+  }
+}
+
+// 渲染按钮组。按状态决定能做什么,避免点了没反应。
+function doubaoButtons(st) {
+  const btns = [];
+  const S = st ? st.state : 'idle';
+  if (S === 'authenticated') {
+    btns.push({ act: 'doubao-test-text', label: '测试文本(消耗额度)' });
+    btns.push({ act: 'doubao-test-image', label: '测试生图(消耗额度)' });
+    btns.push({ act: 'doubao-logout', label: '退出账号', ghost: true });
+    btns.push({ act: 'doubao-relogin', label: '重新登录', ghost: true });
+  } else if (S === 'awaiting_scan' || S === 'opening') {
+    btns.push({ act: 'doubao-cancel-login', label: '取消登录', ghost: true });
+  } else {
+    btns.push({ act: 'doubao-login', label: '扫码登录豆包' });
+  }
+  return btns;
+}
+
+async function refreshDoubao() {
+  try {
+    const st = await api.doubao.status();
+    doubaoState = st;
+    const box = $('doubao-status-text');
+    if (!box) return;
+    const info = doubaoStateText(st);
+    box.textContent = info.text;
+    box.style.color = info.color || '';
+
+    // safeStorage 不可用要明确告知:这种情况下无法保存凭据
+    if (st.encryptionAvailable === false) {
+      box.textContent += ' 【系统安全存储不可用,无法保存登录凭据】';
+      box.style.color = '#f87171';
+    }
+
+    const act = $('doubao-actions');
+    if (act) {
+      act.textContent = '';
+      for (const b of doubaoButtons(st)) {
+        const btn = document.createElement('button');
+        btn.className = 'btn small' + (b.ghost ? ' ghost' : '');
+        btn.textContent = b.label;
+        btn.dataset.act = b.act;
+        act.appendChild(btn);
+      }
+    }
+
+    // 未接受风险提示时,禁止出现任何登录入口
+    try {
+      const r = await api.doubao.riskAccepted();
+      doubaoRiskAccepted = !!(r && r.accepted);
+    } catch { doubaoRiskAccepted = false; }
+    const risk = $('doubao-risk');
+    if (risk) {
+      risk.style.display = (!doubaoRiskAccepted && st.state !== 'authenticated') ? 'block' : 'none';
+    }
+    if (!doubaoRiskAccepted && act) act.style.display = 'none';
+    else if (act) act.style.display = '';
+  } catch (e) {
+    const box = $('doubao-status-text');
+    if (box) box.textContent = '读取豆包状态失败: ' + ((e && e.message) || e);
+  }
+}
+
+async function doubaoLogin() {
+  if (!doubaoRiskAccepted) {
+    toast('请先阅读并确认风险提示', 3200);
+    return;
+  }
+  try {
+    const r = await api.doubao.login();
+    toast(r.ok ? '已打开登录窗口,请扫码' : ('登录启动失败: ' + (r.error || '')), 4000);
+    refreshDoubao();
+  } catch (e) {
+    toast('登录启动失败: ' + ((e && e.message) || e), 4000);
+  }
+}
+
+async function doubaoAcceptRisk() {
+  try {
+    const r = await api.doubao.acceptRisk(true);
+    if (r && r.ok) {
+      doubaoRiskAccepted = true;
+      toast('已确认风险提示', 2600);
+      refreshDoubao();
+    }
+  } catch (e) {
+    toast('操作失败: ' + ((e && e.message) || e), 3200);
+  }
+}
+
+function doubaoDeclineRisk() {
+  const risk = $('doubao-risk');
+  if (risk) risk.style.display = 'none';
+  toast('已取消。未确认风险提示前不会启用豆包登录。', 3200);
+}
+
+async function doubaoTestText() {
+  toast('正在请求豆包(会消耗少量额度)…', 6000);
+  try {
+    const r = await api.doubao.testText('你好，请只回复两个字：收到');
+    if (r && r.ok) {
+      toast('豆包回复: ' + String(r.text || '').slice(0, 40), 6000);
+    } else {
+      toast('失败: ' + ((r && r.error) || '未知'), 6000);
+    }
+    if (r && r.errorKind === 'AUTH_EXPIRED') {
+      refreshDoubao();
+    }
+  } catch (e) {
+    toast('请求失败: ' + ((e && e.message) || e), 5000);
+  }
+}
+
+async function doubaoTestImage() {
+  toast('正在生成测试图(会消耗一次生图额度,约 30-90 秒)…', 10000);
+  try {
+    const r = await api.doubao.testImage('一只白色的猫，坐姿，简洁背景，二次元风格');
+    if (r && r.ok) {
+      toast('生成成功: ' + r.width + 'x' + r.height + ' ' + String(r.format).toUpperCase() + ' ' + (r.bytes/1024).toFixed(0) + 'KB', 8000);
+    } else {
+      toast('生图失败: ' + ((r && r.error) || '未知'), 8000);
+    }
+    if (r && r.errorKind === 'AUTH_EXPIRED') refreshDoubao();
+  } catch (e) {
+    toast('生图请求失败: ' + ((e && e.message) || e), 6000);
+  }
+}
+
+async function doubaoLogout() {
+  try {
+    const r = await api.doubao.logout();
+    toast(r.ok ? '已退出豆包账号,凭据已删除' : ('退出失败: ' + (r.error || '')), 4000);
+    refreshDoubao();
+  } catch (e) {
+    toast('退出失败: ' + ((e && e.message) || e), 3200);
+  }
+}
 
 function toast(msg, ms = 2600) {
   const t = $('toast'); t.textContent = msg; t.style.display = 'block';
@@ -689,6 +867,10 @@ api.onUiRefresh(async (reason) => {
   if (reason === 'external') {
     toast('检测到旧脚本更换了壁纸,已同步', 2200);
   }
+  // 阶段3:豆包登录状态变化由主进程推送
+  if (typeof reason === 'string' && reason.startsWith('doubao:')) {
+    try { await refreshDoubao(); } catch {}
+  }
 });
 
 // 设置页旧任务徽章
@@ -703,4 +885,6 @@ const _origLoadConfig = loadConfig;
 window.addEventListener('DOMContentLoaded', async () => {
   await _origLoadConfig();
   refreshOldTaskBadge();
+  // 阶段3:启动时读一次豆包状态(只读,不会打开任何窗口)
+  try { await refreshDoubao(); } catch {}
 });

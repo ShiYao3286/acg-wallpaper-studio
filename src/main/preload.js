@@ -42,6 +42,18 @@ contextBridge.exposeInMainWorld('api', {
   // 插件管理(阶段2):listPlugins 返回元数据,不含实现对象
   listPlugins: () => ipcRenderer.invoke('list-plugins'),
   setPluginEnabled: (id, on) => ipcRenderer.invoke('set-plugin-enabled', id, on),
+  // 豆包账号(阶段3)。返回值只含状态与时间戳,绝不含 Cookie。
+  doubao: {
+    status: () => ipcRenderer.invoke('doubao-status'),
+    login: () => ipcRenderer.invoke('doubao-login'),
+    cancelLogin: () => ipcRenderer.invoke('doubao-cancel-login'),
+    logout: () => ipcRenderer.invoke('doubao-logout'),
+    openLoginWindow: () => ipcRenderer.invoke('doubao-open-login-window'),
+    riskAccepted: () => ipcRenderer.invoke('doubao-risk-accepted'),
+    acceptRisk: (accepted) => ipcRenderer.invoke('doubao-accept-risk', accepted),
+    testText: (prompt) => ipcRenderer.invoke('doubao-test-text', prompt),
+    testImage: (prompt) => ipcRenderer.invoke('doubao-test-image', prompt),
+  },
   win: {
     minimize: () => ipcRenderer.invoke('win-minimize'),
     close: () => ipcRenderer.invoke('win-close'),

@@ -1,5 +1,5 @@
 // ACG壁纸工作室 - 主进程
-const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, session, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -19,6 +19,11 @@ const loliconProvider = require('./plugins/builtin/lolicon-provider');
 const openaiImageProvider = require('./plugins/builtin/openai-image-provider');
 const openaiTextProvider = require('./plugins/builtin/openai-text-provider');
 const pluginLoader = require('./plugins/plugin-loader');
+// 阶段3:豆包个人账号接入。认证与凭据只在主进程内,绝不进 Renderer。
+const authManager = require('./plugins/auth/auth-manager');
+const credentialService = require('./services/credential-service');
+const doubaoTransport = require('./plugins/builtin/doubao-transport');
+const doubaoProvider = require('./plugins/builtin/doubao-provider');
 // 换壁纸事务(阶段2 第6步从 main.js 迁出)
 const wallpaperService = require('./services/wallpaper-service');
 
@@ -89,6 +94,9 @@ function releaseChanging() {
 // 使"内置实现写坏了"在启动时就暴露,而不是等到用户点「立即换一张」。
 try {
   providerRegistry.registerAll([loliconProvider, openaiImageProvider, openaiTextProvider]);
+// 豆包 Provider 也注册进来,但它在 complete/generate 里会先检查凭据;
+// 未登录时返回可读错误而不是崩溃(见 doubao-provider.js 的 humanize)。
+providerRegistry.registerAll([doubaoProvider.textProvider, doubaoProvider.imageProvider]);
 } catch (err) {
   // 注册失败属于开发期错误(内置 Provider 不该校验不过),
   // 这里不吞掉:直接抛出,让启动失败并暴露问题,避免带病运行。
@@ -141,6 +149,132 @@ async function restoreEnabledPlugins() {
 // 实现已迁至 services/config-service.js;这里只做转发 + 保存后重新应用调度。
 // applySchedule 是副作用,留在 main.js 触发,使 config-service 不需要反向依赖 scheduler。
 configService.init({ userDataDir: app.getPath('userData') });
+
+// ---------- 阶段3:豆包凭据与认证初始化 ----------
+// 依赖方向:main.js -> credential-service / auth-manager / doubao-transport。
+// 三者都不反向依赖 main.js;窗口与 session 通过 init() 注入。
+credentialService.init({
+  userDataDir: app.getPath('userData'),
+  safeStorage,   // electron.safeStorage
+});
+
+// 豆包专用 session(独立 partition,与主窗口隔离)
+const DOUBAO_PARTITION = 'persist:doubao';
+let doubaoLoginWin = null;
+let doubaoSessionRef = null;
+function getDoubaoSession() {
+  if (!doubaoSessionRef) doubaoSessionRef = session.fromPartition(DOUBAO_PARTITION);
+  return doubaoSessionRef;
+}
+
+// 登录窗口:独立 BrowserWindow + 专用 Session,不使用任何 CDP 端口。
+async function openDoubaoLoginWindow() {
+  if (doubaoLoginWin && !doubaoLoginWin.isDestroyed()) {
+    try { doubaoLoginWin.focus(); } catch {}
+    return { ok: true, reused: true };
+  }
+  try {
+    doubaoLoginWin = new BrowserWindow({
+      width: 1100, height: 780,
+      title: '豆包登录',
+      autoHideMenuBar: true,
+      webPreferences: {
+        partition: DOUBAO_PARTITION,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    // 登录页固定地址,不允许窗口自己跳去别处
+    const LOGIN_URL = 'https://www.doubao.com/chat/';
+    doubaoLoginWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    doubaoLoginWin.webContents.on('will-navigate', (ev, url) => {
+      let host = '';
+      try { host = new URL(url).hostname; } catch {}
+      if (!/(^|\.)doubao\.com$/.test(host)) ev.preventDefault();
+    });
+    doubaoLoginWin.on('closed', () => {
+      doubaoLoginWin = null;
+      // 用户关窗视为取消(状态机内部会判断是否还在等待)
+      const st = authManager.getState();
+      if (st.state === 'awaiting_scan' || st.state === 'opening') {
+        authManager.cancelLogin('用户关闭了登录窗口').catch(() => {});
+      }
+    });
+    await doubaoLoginWin.loadURL(LOGIN_URL);
+    return { ok: true };
+  } catch (e) {
+    doubaoLoginWin = null;
+    return { ok: false, error: '打开登录窗口失败: ' + ((e && e.message) || e) };
+  }
+}
+
+function closeDoubaoLoginWindow() {
+  if (doubaoLoginWin && !doubaoLoginWin.isDestroyed()) {
+    try { doubaoLoginWin.close(); } catch {}
+  }
+  doubaoLoginWin = null;
+}
+
+// 从专用 session 读 Cookie。只碰豆包域,不读用户默认浏览器。
+const DOUBAO_COOKIE_URLS = [
+  'https://www.doubao.com/',
+  'https://doubao.com/',
+  'https://passport.doubao.com/',
+];
+async function readDoubaoSessionCookies() {
+  const ses = getDoubaoSession();
+  const map = new Map();
+  for (const url of DOUBAO_COOKIE_URLS) {
+    const list = await ses.cookies.get({ url });
+    for (const c of list) {
+      if (c && c.name && typeof c.value === 'string' && c.value && !map.has(c.name)) {
+        map.set(c.name, c.value);
+      }
+    }
+  }
+  return map;
+}
+
+// 清理专用 session 里豆包相关的 Cookie。不动其他域名、不动主窗口 session。
+async function clearDoubaoSession() {
+  const ses = getDoubaoSession();
+  for (const url of DOUBAO_COOKIE_URLS) {
+    try {
+      const list = await ses.cookies.get({ url });
+      for (const c of list) {
+        if (!c || !c.name) continue;
+        const scheme = c.secure ? 'https://' : 'http://';
+        const domain = String(c.domain || '').replace(/^\./, '');
+        if (!domain) continue;
+        try {
+          await ses.cookies.remove(scheme + domain + (c.path || '/'), c.name);
+        } catch {}
+      }
+    } catch {}
+  }
+  try { await ses.cookies.flushStore(); } catch {}
+}
+
+// 认证管理器初始化:依赖全部注入,状态变化时刷新 UI
+authManager.init({
+  openLoginWindow: openDoubaoLoginWindow,
+  closeLoginWindow: closeDoubaoLoginWindow,
+  clearSession: clearDoubaoSession,
+  readSessionCookies: readDoubaoSessionCookies,
+  credential: credentialService,
+  now: () => Date.now(),
+  pollIntervalMs: 2000,
+  scanTimeoutMs: 5 * 60 * 1000,
+  onStateChange: (st) => { notifyUiRefresh('doubao:' + st.state); },
+});
+
+// 传输层初始化:凭据由 credential-service 提供,Provider 永远看不到 Cookie
+doubaoTransport.init({
+  getCookieHeader: () => credentialService.getCookieHeader(),
+  fetchImpl: (url, opts) => netFetch(url, opts),
+  now: () => Date.now(),
+});
 const confDir = configService.confDir;
 const confFile = configService.confFile;
 const deepMerge = configService.deepMerge;
@@ -911,6 +1045,117 @@ ipcMain.handle('favorite-current', async () => {
 // ---------- 插件管理(阶段2 第4步) ----------
 // 返回:内置 Provider(始终启用) + 外部插件(含未启用/加载失败原因)。
 // 注意只返回元数据,绝不把 Provider 实现对象或函数传给渲染层。
+// ---------- 豆包账号(阶段3 3.6) ----------
+// 风险提示接受状态。只记录"用户已确认",不含任何凭据。
+// 必须在任何使用它的 handler 之前声明(let 有 TDZ,声明在后会抛 ReferenceError)。
+let hasAcceptedDoubaoRisk = false;
+// 返回给渲染层的只有状态与时间戳,【绝不含 Cookie】。
+ipcMain.handle('doubao-status', async () => {
+  const st = authManager.getState();
+  const cred = await credentialService.describe();
+  return {
+    state: st.state,
+    lastError: st.lastError,
+    inFlight: st.inFlight,
+    encryptionAvailable: cred.encryptionAvailable,
+    credentialPresent: cred.present,
+    savedAt: cred.savedAt || 0,
+    cookieCount: cred.cookieCount || 0,
+    credentialError: cred.error || '',
+  };
+});
+
+// 开始扫码登录。需要用户先确认风险提示，由渲染层负责把关。
+ipcMain.handle('doubao-login', async () => {
+  try {
+    const r = await authManager.beginLogin();
+    return r.ok ? ok({ state: r.state }) : fail(r.error || '登录启动失败', ERROR_CODES.E_STATE);
+  } catch (e) {
+    return failFrom(e, ERROR_CODES.E_STATE);
+  }
+});
+
+ipcMain.handle('doubao-cancel-login', async () => {
+  try {
+    const r = await authManager.cancelLogin('用户取消');
+    return r.ok ? ok({ state: r.state }) : fail(r.error || '取消失败', ERROR_CODES.E_STATE);
+  } catch (e) {
+    return failFrom(e, ERROR_CODES.E_STATE);
+  }
+});
+
+ipcMain.handle('doubao-logout', async () => {
+  try {
+    await authManager.logout();
+    credentialService.invalidateCache();
+    return ok({ state: 'idle' });
+  } catch (e) {
+    return failFrom(e, ERROR_CODES.E_STATE);
+  }
+});
+
+// 手动打开登录窗口(供"重新登录"用,与 doubao-login 等价但更明确)
+ipcMain.handle('doubao-open-login-window', async () => {
+  if (!hasAcceptedDoubaoRisk) {
+    return fail('请先阅读并确认风险提示', ERROR_CODES.E_STATE);
+  }
+  try {
+    const r = await authManager.beginLogin();
+    return r.ok ? ok({ state: r.state }) : fail(r.error || '登录启动失败', ERROR_CODES.E_STATE);
+  } catch (e) {
+    return failFrom(e, ERROR_CODES.E_STATE);
+  }
+});
+
+ipcMain.handle('doubao-risk-accepted', async () => ({ accepted: hasAcceptedDoubaoRisk }));
+ipcMain.handle('doubao-accept-risk', async (e, accepted) => {
+  if (typeof accepted !== 'boolean') return fail('参数必须是布尔值', ERROR_CODES.E_INVALID_ARG);
+  hasAcceptedDoubaoRisk = accepted;
+  return ok({ accepted });
+});
+
+// 人工验证入口:明确提示会消耗额度,只在用户主动调用时执行。
+// 【不是自动流程】,也不做任何自动重试。
+ipcMain.handle('doubao-test-text', async (e, prompt) => {
+  let text;
+  try { text = assertTheme(prompt); } catch (err) { return argFail(err); }
+  if (!text) text = '你好，请只回复两个字：收到';
+  try {
+    const r = await doubaoTransport.converse({ prompt: text, isImage: false, timeoutMs: 60000 });
+    return ok({ text: r.text, conversationId: r.conversationId, degraded: r.degraded });
+  } catch (err) {
+    return fail(doubaoProvider.humanize(err), ERROR_CODES.E_NET, { errorKind: err && err.kind });
+  }
+});
+
+// 人工验证生图:会消耗一次生图额度。明确不做自动重试。
+ipcMain.handle('doubao-test-image', async (e, prompt) => {
+  let text;
+  try { text = assertTheme(prompt); } catch (err) { return argFail(err); }
+  if (!text) text = '一只白色的猫，坐姿，简洁背景，二次元风格';
+  try {
+    // 走 Provider 完整链路(含图片下载与格式校验),但不写壁纸目录、不触发换图。
+    const svc = { id: 'doubao-image' };
+    const res = await doubaoProvider.imageProvider.generate({
+      config: { ai: { prompt: text } },
+      doubao: { converse: (o) => doubaoTransport.converse(o) },
+      netFetch,
+      prompt: text,
+      serviceId: svc.id,
+      timeoutMs: 180000,
+    });
+    return ok({
+      bytes: res.buffer.length, format: res.format,
+      width: res.width, height: res.height,
+      conversationId: res.conversationId,
+      // 只回传 sha256 前 16 位作为证据,不回传图片本身(避免大 payload 进 IPC)
+      sha256: require('crypto').createHash('sha256').update(res.buffer).digest('hex').slice(0, 16),
+    });
+  } catch (err) {
+    return fail(doubaoProvider.humanize(err), ERROR_CODES.E_NET, { errorKind: err && err.kind });
+  }
+});
+
 ipcMain.handle('list-plugins', async () => {
   const cfg = await loadConfig();
   const scan = scanExternalPlugins();

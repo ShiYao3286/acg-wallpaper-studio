@@ -375,6 +375,32 @@ textarea { resize:vertical; }
 
     <div class="page" id="page-services">
       <h2><svg><use href="#i-plug"/></svg>API 服务</h2>
+
+      <!-- 豆包账号(阶段3) -->
+      <div class="card" id="doubao-card">
+        <div style="font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:7px">
+          <svg style="width:15px;height:15px"><use href="#i-zap"/></svg>豆包账号(个人账号,非官方接入)
+        </div>
+        <p class="hint" id="doubao-status-text">正在读取状态…</p>
+        <div class="row" id="doubao-actions" style="margin-top:8px"></div>
+        <div id="doubao-risk" style="display:none;margin-top:12px;padding:12px;border:1px solid rgba(236,72,153,.35);border-radius:10px;background:rgba(236,72,153,.06)">
+          <div style="font-weight:600;margin-bottom:8px;color:#f9a8d4">非官方接入风险提示</div>
+          <div class="hint" style="line-height:1.7">
+            本功能通过豆包网页端登录会话及<b>未公开接口</b>提供服务,<b>不属于豆包官方授权 API</b>。<br>
+            使用本功能可能违反豆包相关服务条款。接口、功能和登录机制可能随服务端更新而变化,
+            可能出现服务中断、限流、安全验证或账号限制等情况。<br>
+            登录后,本应用需要在本机保存用于访问豆包服务的会话凭据。该凭据具有账号访问能力,
+            将通过系统安全存储机制加密保存,不会明文写入配置文件,也不会发送给本应用以外的任何服务。<br>
+            请勿使用他人账号,不要提交敏感个人信息、商业机密或其他不适合发送给第三方服务的数据。<br><br>
+            继续使用代表你已阅读上述风险,并自行决定是否启用本功能。<b>这不代表豆包官方认可或授权。</b>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn small" data-act="doubao-accept-risk">我已阅读并同意,继续</button>
+            <button class="btn small ghost" data-act="doubao-decline-risk">取消</button>
+          </div>
+        </div>
+      </div>
+
       <div class="card">
         <p class="hint">预设多个 OpenAI 兼容 API(画图 / 文本)。画图服务用于 AI 壁纸;文本服务驱动「提示词助手」结合标签池写提示词。支持拉取模型列表与连通测试。</p>
         <div id="svc-list" style="margin-top:12px"></div>

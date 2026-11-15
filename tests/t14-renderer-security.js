@@ -37,7 +37,9 @@ const js = fs.readFileSync(RENDERER, 'utf8');
     ok('B1', 'index.html 已无任何内联事件处理器', inline.length === 0, '残留 ' + inline.length + ' 处');
     const acts = html.match(/data-act="/g) || [];
     const sets = html.match(/data-set="/g) || [];
-    ok('B2', 'data-act 数量与改造前 onclick 一致 29', acts.length === 29, '实际 ' + acts.length);
+    // 不写死数量:阶段3 新增豆包卡片后交互元素会增长。
+    // 真正要保障的是"没有残留内联事件"(B1)与"每个 data-act 都有实现"(C5)。
+    ok('B2', 'data-act 元素数量不小于去内联事件时的基线 29', acts.length >= 29, '实际 ' + acts.length);
     ok('B3', 'data-set 数量与改造前 onchange 一致 9', sets.length === 9, '实际 ' + sets.length);
     ok('B4', 'HTML 中不再出现内联函数调用文本', html.indexOf('onclick="api.') < 0 && !/onclick="[a-zA-Z_]+\(/.test(html));
   }
