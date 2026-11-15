@@ -44,7 +44,46 @@ const CLIENT_PARAMS = {
 
 const CHAT_URL = 'https://www.doubao.com/chat/completion';
 const BOT_ID = '7338286299411103781';
-const CARRIER_MODEL = '0';        // 生图挂在「豆包 快速」上,不是独立生图模型
+const CARRIER_MODEL = '0';        // 默认载体模型(豆包快速)
+const DEFAULT_TEXT_MODEL = '0';
+const IMAGE_SKILL_TYPE = 3;       // input_skill.skill_type = 3 -> Seedream 生图
+
+// 模型目录(阶段3 审核:按"是否工作任务"分类)。
+//
+// 依据:参考实现在 doubao-catalog.ts 里标注 taskMode 的实测清单,
+// 加上阶段3.1 与 3.6 的实测。这些 key 是豆包的 model_item_key,不是通用模型名。
+//
+// 【为什么要有 available 字段】
+//   标了「工作任务」的模型(id 5 / 9 / seed-lite-7b 等)会让服务端把这一轮
+//   当成工作任务处理,进而尝试调用本地工具执行器。本项目明确不接入该能力,
+//   因此这些模型只做展示(让用户知道豆包有什么),但禁止选中。
+const MODEL_CATALOG = [
+  { key: '0', name: '豆包 快速', taskMode: false, reasoning: false, available: true },
+  { key: '3', name: '豆包 2.1 Turbo', taskMode: false, reasoning: true, available: true },
+  { key: 'seed-lite-7b', name: '豆包 2.1 Lite', taskMode: true, reasoning: true, available: false, blockedReason: '属于「工作任务」模型,本应用不接入工具执行能力' },
+  { key: '5', name: '豆包 2.1 Pro', taskMode: true, reasoning: true, available: false, blockedReason: '属于「工作任务」模型,本应用不接入工具执行能力' },
+  { key: '9', name: '自动', taskMode: true, reasoning: true, available: false, blockedReason: '属于「工作任务」模型,本应用不接入工具执行能力' },
+];
+
+// 生图模型:豆包生图不是独立 model_item_key,而是 input_skill 触发,
+// 服务端按账号权益路由 Seedream 版本。这里给一个稳定的逻辑标识。
+const IMAGE_MODEL_KEY = 'image-gen';
+const IMAGE_MODEL_NAME = '豆包生图(Seedream,服务端路由)';
+
+function listModels() {
+  return MODEL_CATALOG.map(m => ({ ...m }));
+}
+
+// 校验模型 key:必须是 available 的才会被真正发出去。
+// 传入未知 key 一律回落到默认模型,避免把任意字符串透给服务端。
+function resolveTextModel(key) {
+  const k = typeof key === 'string' ? key.trim() : '';
+  if (!k) return { key: DEFAULT_TEXT_MODEL, blocked: null };
+  const hit = MODEL_CATALOG.find(m => m.key === k);
+  if (!hit) return { key: DEFAULT_TEXT_MODEL, blocked: { key: k, reason: '未知模型,已回落到默认模型' } };
+  if (!hit.available) return { key: DEFAULT_TEXT_MODEL, blocked: { key: k, reason: hit.blockedReason } };
+  return { key: hit.key, blocked: null };
+}
 const REASONING_EFFORT = 5;
 const AGENT_MODE_CHAT = 2;        // 2=普通对话,1=工作任务【绝不使用 1】
 
@@ -98,6 +137,10 @@ function buildBody(prompt, opts) {
   const o = opts || {};
   const lid = crypto.randomUUID();
   const plainTask = { server_do_compare: true };
+  // 模型必须经 resolveTextModel 过滤:不可用的(工作任务类/未知)一律回落默认,
+  // 绝不把任意字符串透给服务端。
+  const modelKey = resolveTextModel(o.modelKey).key;
+  const effort = Number.isInteger(o.reasoningEffort) ? o.reasoningEffort : REASONING_EFFORT;
   const body = {
     messages: [{
       local_message_id: lid, message_status: 0,
@@ -117,7 +160,7 @@ function buildBody(prompt, opts) {
       scene_type: 0, unique_key: crypto.randomUUID(), start_seq: 0,
       need_create_conversation: true,
       conversation_init_option: { need_ack_conversation: true },
-      conversation_init_ext: { model_item_key: CARRIER_MODEL, reasoning_effort: String(REASONING_EFFORT), mode_id: '1' },
+      conversation_init_ext: { model_item_key: modelKey, reasoning_effort: String(effort), mode_id: '1' },
       regen_query_id: [], edit_query_id: [],
       regen_instruction: '', no_replace_for_regen: false, message_from: 0,
       shared_app_name: '', shared_app_id: '',
@@ -126,11 +169,11 @@ function buildBody(prompt, opts) {
       general_task_param: plainTask,
       recovery_option: { is_recovery: false, req_create_time_sec: Math.floor(deps.now() / 1000), append_sse_event_scene: 0 },
       message_storage_type: 0, related_deleted_message_ids: {}, connector_info_list: [],
-      model_config: { model_item_key: CARRIER_MODEL, model_extra_params: {}, reasoning_effort: REASONING_EFFORT },
+      model_config: { model_item_key: modelKey, model_extra_params: {}, reasoning_effort: effort },
       aggregate_params: {
         mention_skill_list: '[]', mention_plugin_list: '[]', mention_ext: '[{}]',
-        conversation_mode: '', mode_id: '1', model_item_key: CARRIER_MODEL,
-        agent_mode: '2', reasoning_effort: String(REASONING_EFFORT), provider_id: '',
+        conversation_mode: '', mode_id: '1', model_item_key: modelKey,
+        agent_mode: '2', reasoning_effort: String(effort), provider_id: '',
       },
     },
     client_meta: {
@@ -152,7 +195,7 @@ function buildBody(prompt, opts) {
     },
   };
   if (o.isImage) {
-    body.ext.input_skill = JSON.stringify({ skill_id: '3', skill_type: 3, variables: {} });
+    body.ext.input_skill = JSON.stringify({ skill_id: String(IMAGE_SKILL_TYPE), skill_type: IMAGE_SKILL_TYPE, variables: {} });
   }
   return body;
 }
@@ -273,5 +316,7 @@ async function converse(opts) {
 
 module.exports = {
   init, converse, buildBody, buildHeaders, buildUrl, classifyServerError,
-  ERR, PROTOCOL, CLIENT_PARAMS, CHAT_URL, BOT_ID, CARRIER_MODEL, AGENT_MODE_CHAT,
+  ERR, PROTOCOL, CLIENT_PARAMS, CHAT_URL, BOT_ID,
+  CARRIER_MODEL, DEFAULT_TEXT_MODEL, IMAGE_MODEL_KEY, IMAGE_MODEL_NAME, IMAGE_SKILL_TYPE,
+  MODEL_CATALOG, listModels, resolveTextModel, AGENT_MODE_CHAT,
 };

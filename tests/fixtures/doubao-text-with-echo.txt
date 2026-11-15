@@ -1,0 +1,20 @@
+id: 0
+event: SSE_ACK
+data: {"ack_client_meta":{"conversation_id":"c-real"}}
+
+id: 0
+event: FULL_MSG_NOTIFY
+data: {"message":{"content_block":[{"block_type":10000,"content":{"text_block":{"text":"请只回答：苹果"}}}],"ext":{"message_from":"InputBox"}}}
+
+id: 0
+event: STREAM_MSG_NOTIFY
+data: {"content":{"content_block":[{"block_type":10000,"block_id":"b1","content":{"text_block":{"text":"苹果"}}}]}}
+
+id: 0
+event: STREAM_CHUNK
+data: {"message_id":"m1","patch_op":[{"patch_object":1,"patch_value":{"content_block":[{"block_type":10000,"block_id":"b1","content":{"text_block":{}},"is_finish":true}]}}]}
+
+id: 0
+event: SSE_REPLY_END
+data: {}
+

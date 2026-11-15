@@ -40,6 +40,10 @@ const DEFAULT_CONFIG = {
   // 外部插件(阶段2)。enabled 是用户显式启用的插件 id 列表。
   // 默认空:外部插件不会自动执行,必须用户手动开启。
   plugins: { enabled: [] },
+  // 豆包账号(阶段3)。只存"选哪个模型",不存任何凭据。
+  //   textModel       文本对话用的 model_item_key
+  //   reasoningEffort 推理强度(3低/4中/5高),仅对支持思考的模型有意义
+  doubao: { textModel: '0', reasoningEffort: 5 },
 };
 
 // 本地风格词池:文本模型未配置时的提示词增强兜底

@@ -19,3 +19,9 @@ Thumbs.db
 
 # 测试运行时产物(每次执行 run-all.js 都会重写,不入库)
 tests/last-run.json
+
+# 凭据与账号数据(阶段3):凭据实际存在 userData 下,不在仓库内。
+# 这几条是纵深防御 —— 万一将来有人把 userData 拷进仓库,也不会误提交。
+credentials.enc
+credentials.enc.*
+doubao/

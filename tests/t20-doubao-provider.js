@@ -186,6 +186,103 @@ function mkRes(text, okFlag, status) {
     ok('E15', '生图 Provider 同样声明 auth', provider.imageProvider.auth && provider.imageProvider.auth.statusKey === 'doubao');
   }
 
+
+  group('F 模型目录与选择');
+  {
+    ok('F1', '模型目录非空且含安全模型', transport.MODEL_CATALOG.length >= 2 && transport.listModels().some(m => m.available));
+    ok('F2', '工作任务模型被标记为不可用', (() => {
+      const t = transport.MODEL_CATALOG.filter(m => m.taskMode);
+      return t.length > 0 && t.every(m => m.available === false && m.blockedReason);
+    })(), '避免选中后触发本地工具执行器');
+    ok('F3', 'resolveTextModel 放行安全模型', transport.resolveTextModel('3').key === '3');
+    ok('F4', 'resolveTextModel 拒绝工作任务模型并回落', (() => {
+      const r = transport.resolveTextModel('5');
+      return r.key === transport.DEFAULT_TEXT_MODEL && r.blocked && /工作任务/.test(r.blocked.reason);
+    })());
+    ok('F5', 'resolveTextModel 拒绝未知模型', (() => {
+      const r = transport.resolveTextModel('totally-made-up');
+      return r.key === transport.DEFAULT_TEXT_MODEL && r.blocked;
+    })());
+    ok('F6', '空模型 key 回落默认且不报错', (() => {
+      const r = transport.resolveTextModel('');
+      return r.key === transport.DEFAULT_TEXT_MODEL && r.blocked === null;
+    })());
+
+    // 请求体确实用了传入的模型
+    let captured = null;
+    transport.init({
+      getCookieHeader: async () => 'c=1',
+      fetchImpl: async (url, opts) => { captured = opts; return mkRes(TEXT_STREAM); },
+      now: () => 1,
+    });
+    await transport.converse({ prompt: 'x', modelKey: '3' });
+    const b1 = JSON.parse(captured.body);
+    ok('F7', '请求体使用指定模型(四处镜像一致)', (() => {
+      const k = '3';
+      return b1.option.conversation_init_ext.model_item_key === k
+        && b1.option.model_config.model_item_key === k
+        && b1.option.aggregate_params.model_item_key === k;
+    })());
+    ok('F8', '未指定模型时用默认模型', (() => {
+      return b1.option.agent_mode === 2;
+    })());
+
+    await transport.converse({ prompt: 'x', modelKey: '5' });   // 工作任务模型
+    const b2 = JSON.parse(captured.body);
+    ok('F9', '传入工作任务模型时实际发出的是默认模型', b2.option.model_config.model_item_key === transport.DEFAULT_TEXT_MODEL,
+      'model=' + b2.option.model_config.model_item_key);
+    ok('F10', '任何情况下 agent_mode 都不是 1', b2.option.agent_mode === 2);
+  }
+
+  group('G 文本回显隔离');
+  {
+    // 阶段3 实测发现:FULL_MSG_NOTIFY 携带完整历史(含用户自己那条问题),
+    // 若把它也当答案拼接,会得到「问题+回答」。修复后只从 CHUNK 类事件取文本。
+    const withEcho = 'id: 0\nevent: SSE_ACK\ndata: {"ack_client_meta":{"conversation_id":"c9"}}\n\n' +
+      'id: 0\nevent: FULL_MSG_NOTIFY\ndata: {"message":{"content_block":[{"block_type":10000,"content":{"text_block":{"text":"请只回答：苹果"}}}]}}\n\n' +
+      'id: 0\nevent: STREAM_CHUNK\ndata: {"message":{"content_block":[{"block_type":10000,"content":{"text_block":{"text":"苹果"}}}]}}\n\n' +
+      'id: 0\nevent: SSE_REPLY_END\ndata: {}\n\n';
+    const r = stream.parseAll(withEcho);
+    ok('G1', 'NOTIFY 中的用户问题不回显进答案', r.text === '苹果', JSON.stringify(r.text));
+    ok('G2', 'NOTIFY 不影响元信息提取', r.conversationId === 'c9');
+
+    const imgNotify = 'id: 0\nevent: STREAM_MSG_NOTIFY\ndata: {"content":{"creation_block":{"creations":[{"type":1,"id":"t1","image":{"key":"k","image_ori":{"url":"https://x/y.jpeg","width":2048,"height":2048}}}]}}}\n\n';
+    const ri = stream.parseAll(imgNotify);
+    ok('G3', 'NOTIFY 里的创建块仍能提取(生图依赖)', ri.creations.length === 1 && ri.creations[0].width === 2048);
+    ok('G4', 'NOTIFY 不产生文本', ri.text === '', JSON.stringify(ri.text));
+
+    const thinkThenAnswer = 'id: 0\nevent: STREAM_CHUNK\ndata: {"content_block":[{"block_type":10040,"content":{"thinking_block":{"text":"内部思考"}}}]}\n\n' +
+      'id: 0\nevent: STREAM_CHUNK\ndata: {"content_block":[{"block_type":10000,"content":{"text_block":{"text":"答案"}}}]}\n\n';
+    ok('G5', '思考块内容不混入答案', stream.parseAll(thinkThenAnswer).text === '答案', JSON.stringify(stream.parseAll(thinkThenAnswer).text));
+  }
+
+
+  group('H 真实流样本回归');
+  {
+    const fsx = require('node:fs');
+    const FX = path.join(__dirname, 'fixtures');
+    const readFx = (n) => fsx.readFileSync(path.join(FX, n), 'utf8');
+
+    // 这是从真实豆包响应抓下来的样本(已脱敏):
+    //   FULL_MSG_NOTIFY 带 ext.message_from='InputBox' → 用户回显,不能取文本
+    //   STREAM_MSG_NOTIFY 的 content.content_block → 助手答案
+    //   STREAM_CHUNK 是 patch_op 增量,此样本只带 is_finish
+    const real = stream.parseAll(readFx('doubao-text-with-echo.txt'));
+    ok('H1', '真实流:用户回显不进答案', !real.text.includes('请只回答'), JSON.stringify(real.text));
+    ok('H2', '真实流:答案被正确提取', real.text === '苹果', JSON.stringify(real.text));
+    ok('H3', '真实流:事件全部保留', real.events.length >= 5, real.events.join(','));
+    ok('H4', '真实流:无 JSON 解析错误', real.parseErrors === 0);
+    ok('H5', '真实流:conversationId 被提取', real.conversationId === 'c-real');
+
+    // 累积快照:同一 block_id 多次推送越来越长的文本,只能追加新增部分
+    const acc = stream.parseAll(readFx('doubao-cumulative-snapshot.txt'));
+    ok('H6', '累积快照去重(不重复拼接)', acc.text === '你好呀', JSON.stringify(acc.text));
+
+    // 生图创建块只在 NOTIFY 里,必须能提取
+    const img = stream.parseAll(readFx('doubao-image-creation.txt'));
+    ok('H7', '真实流:生图创建块被提取', img.creations.length === 1 && img.creations[0].width === 2048);
+    ok('H8', '真实流:生图帧不产生文本', img.text === '', JSON.stringify(img.text));
+  }
   const s = summarize();
   console.log('');
   console.log('---- 第二十部分小结: ' + s.passed + '/' + s.total + ' 通过, ' + s.failed + ' 失败' + (s.skipped ? ', ' + s.skipped + ' 跳过' : '') + ' ----');

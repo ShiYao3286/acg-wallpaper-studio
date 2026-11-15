@@ -53,6 +53,8 @@ contextBridge.exposeInMainWorld('api', {
     acceptRisk: (accepted) => ipcRenderer.invoke('doubao-accept-risk', accepted),
     testText: (prompt) => ipcRenderer.invoke('doubao-test-text', prompt),
     testImage: (prompt) => ipcRenderer.invoke('doubao-test-image', prompt),
+    models: () => ipcRenderer.invoke('doubao-models'),
+    setModel: (modelKey, effort) => ipcRenderer.invoke('doubao-set-model', modelKey, effort),
   },
   win: {
     minimize: () => ipcRenderer.invoke('win-minimize'),

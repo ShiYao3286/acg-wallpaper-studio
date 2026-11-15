@@ -1,0 +1,12 @@
+id: 0
+event: STREAM_MSG_NOTIFY
+data: {"content":{"content_block":[{"block_type":10000,"block_id":"x1","content":{"text_block":{"text":"你"}}}]}}
+
+id: 0
+event: STREAM_MSG_NOTIFY
+data: {"content":{"content_block":[{"block_type":10000,"block_id":"x1","content":{"text_block":{"text":"你好"}}}]}}
+
+id: 0
+event: STREAM_MSG_NOTIFY
+data: {"content":{"content_block":[{"block_type":10000,"block_id":"x1","content":{"text_block":{"text":"你好呀"}}}]}}
+

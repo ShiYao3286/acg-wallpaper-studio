@@ -1,0 +1,12 @@
+id: 0
+event: SSE_ACK
+data: {"ack_client_meta":{"conversation_id":"c-img"}}
+
+id: 0
+event: STREAM_MSG_NOTIFY
+data: {"content":{"creation_block":{"creations":[{"type":1,"id":"t1","image":{"key":"tos/rc_gen_image/a.jpeg","image_ori":{"url":"https://example.invalid/a.jpeg","width":2048,"height":2048}}}]}}}
+
+id: 0
+event: SSE_REPLY_END
+data: {}
+

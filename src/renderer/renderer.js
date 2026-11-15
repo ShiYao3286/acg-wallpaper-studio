@@ -58,6 +58,14 @@ const CLICK_ACTIONS = {
   'doubao-test-image': () => doubaoTestImage(),
 };
 
+// 模型下拉变更即保存(不需要额外按钮)
+document.addEventListener('change', (ev) => {
+  const t = ev.target;
+  if (t && (t.id === 'doubao-model-select' || t.id === 'doubao-effort-select')) {
+    saveDoubaoModel();
+  }
+});
+
 // change 类:key 来自 data-key,值来自元素自身
 const CHANGE_SETTERS = {
   str: (el) => saveStr(el.dataset.key, el.value),
@@ -98,6 +106,68 @@ document.addEventListener('change', (ev) => {
 
 let doubaoRiskAccepted = false;
 let doubaoState = null;
+
+// 模型选择:全部列出,但只允许选 available 的。
+// 工作任务模型列出来是让用户知道豆包有什么,不是给他用的 ——
+// 选中后服务端会让那一轮变成工作任务并尝试调用本地工具执行器,本项目不接这个能力。
+async function refreshDoubaoModels() {
+  const sel = $('doubao-model-select');
+  const eff = $('doubao-effort-select');
+  const hint = $('doubao-model-hint');
+  const box = $('doubao-models');
+  if (!sel || !box) return;
+  try {
+    const m = await api.doubao.models();
+    sel.textContent = '';
+    for (const item of m.models) {
+      const opt = document.createElement('option');
+      opt.value = item.key;
+      opt.textContent = item.name
+        + (item.taskMode ? ' [工作任务]' : '')
+        + (item.available ? '' : ' — 不可选');
+      // 不可用的置灰并禁用,但仍展示(选 B 方案)
+      if (!item.available) { opt.disabled = true; opt.style.color = '#6b7280'; }
+      sel.appendChild(opt);
+    }
+    sel.value = m.current;
+
+    // 推理强度:仅对支持思考的模型有意义,但不隐藏(用户可能切换模型)
+    if (eff) {
+      eff.textContent = '';
+      for (const lv of m.effortLevels) {
+        const o = document.createElement('option');
+        o.value = String(lv.level);
+        o.textContent = lv.name;
+        eff.appendChild(o);
+      }
+      eff.value = String(m.reasoningEffort || 5);
+    }
+
+    // 提示:生图模型不可选(服务端路由)
+    if (hint) {
+      hint.textContent = '画图:' + m.imageModel.name + '。生图不走模型选择,由豆包服务端按账号权益路由。';
+    }
+    box.style.display = '';
+  } catch (e) {
+    if (hint) hint.textContent = '读取模型列表失败: ' + ((e && e.message) || e);
+  }
+}
+
+async function saveDoubaoModel() {
+  const sel = $('doubao-model-select');
+  const eff = $('doubao-effort-select');
+  if (!sel) return;
+  try {
+    const r = await api.doubao.setModel(sel.value, Number(eff ? eff.value : 5));
+    if (r && r.ok) {
+      toast('已切换模型: ' + sel.options[sel.selectedIndex].textContent, 3000);
+    } else {
+      toast('切换失败: ' + ((r && r.error) || '未知'), 4000);
+    }
+  } catch (e) {
+    toast('切换失败: ' + ((e && e.message) || e), 3200);
+  }
+}
 
 // 状态 → 人话 + 颜色。
 function doubaoStateText(st) {
@@ -178,6 +248,13 @@ async function refreshDoubao() {
     }
     if (!doubaoRiskAccepted && act) act.style.display = 'none';
     else if (act) act.style.display = '';
+
+    // 模型选择区:仅登录后显示;未登录时没有意义
+    const modelBox = $('doubao-models');
+    if (modelBox) {
+      if (st.state === 'authenticated') { await refreshDoubaoModels(); }
+      else { modelBox.style.display = 'none'; }
+    }
   } catch (e) {
     const box = $('doubao-status-text');
     if (box) box.textContent = '读取豆包状态失败: ' + ((e && e.message) || e);

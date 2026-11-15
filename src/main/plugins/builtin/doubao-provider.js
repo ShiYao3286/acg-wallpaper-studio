@@ -66,7 +66,13 @@ async function complete(ctx) {
   const prompt = sysMsg ? (sysMsg + '\n\n' + userMsg) : userMsg;
 
   try {
-    const r = await tx.converse({ prompt, isImage: false, timeoutMs: ctx.timeoutMs || 90000, signal: ctx.signal });
+    const r = await tx.converse({
+      prompt, isImage: false,
+      modelKey: ctx.modelKey,            // 由 main.js 从配置读取并校验后传入
+      reasoningEffort: ctx.reasoningEffort,
+      timeoutMs: ctx.timeoutMs || 90000,
+      signal: ctx.signal,
+    });
     const text = (r.text || '').trim();
     if (!text) return { ok: false, error: '豆包返回为空' + (r.degraded ? '(接口结构可能已变化)' : '') };
     return { ok: true, prompt: text, local: false, conversationId: r.conversationId, degraded: r.degraded };
@@ -153,7 +159,12 @@ async function generate(ctx) {
 
   let r;
   try {
-    r = await tx.converse({ prompt: finalPrompt, isImage: true, timeoutMs: ctx.timeoutMs || 180000, signal: ctx.signal });
+    r = await tx.converse({
+      prompt: finalPrompt, isImage: true,
+      modelKey: ctx.modelKey,            // 生图也用同一个载体模型,skill 由 isImage 触发
+      timeoutMs: ctx.timeoutMs || 180000,
+      signal: ctx.signal,
+    });
   } catch (e) {
     throw new Error(humanize(e));
   }

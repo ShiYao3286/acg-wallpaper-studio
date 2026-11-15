@@ -1114,15 +1114,55 @@ ipcMain.handle('doubao-accept-risk', async (e, accepted) => {
   return ok({ accepted });
 });
 
+// 模型列表与选择(阶段3 审核需求)。
+// 返回全部模型供展示,但只有 available=true 的能被选中;
+// 工作任务类模型列出来是为了让用户知道豆包有什么,不是给他用的。
+ipcMain.handle('doubao-models', async () => {
+  const cfg = await loadConfig();
+  const cur = (cfg.doubao && cfg.doubao.textModel) || doubaoTransport.DEFAULT_TEXT_MODEL;
+  return {
+    models: doubaoTransport.listModels(),
+    imageModel: { key: doubaoTransport.IMAGE_MODEL_KEY, name: doubaoTransport.IMAGE_MODEL_NAME },
+    current: cur,
+    reasoningEffort: (cfg.doubao && cfg.doubao.reasoningEffort) || 5,
+    effortLevels: [
+      { level: 3, name: '低' }, { level: 4, name: '中' }, { level: 5, name: '高' },
+      { level: 6, name: '极高' }, { level: 7, name: '最高' },
+    ],
+  };
+});
+
+ipcMain.handle('doubao-set-model', async (e, modelKey, effort) => {
+  // 只接受 available 的模型;被拒绝时明确告知原因而不是静默回落
+  const r = doubaoTransport.resolveTextModel(modelKey);
+  if (r.blocked) {
+    return fail(r.blocked.reason, ERROR_CODES.E_INVALID_ARG, { blockedKey: r.blocked.key });
+  }
+  let eff = (cfgEffort => (Number.isInteger(cfgEffort) ? cfgEffort : 5))(Number(effort));
+  if (eff < 3 || eff > 7) eff = 5;
+  try {
+    await saveConfig({ doubao: { textModel: r.key, reasoningEffort: eff } });
+    return ok({ model: r.key, reasoningEffort: eff });
+  } catch (err) {
+    return failFrom(err, ERROR_CODES.E_IO, { configAborted: true });
+  }
+});
+
 // 人工验证入口:明确提示会消耗额度,只在用户主动调用时执行。
 // 【不是自动流程】,也不做任何自动重试。
 ipcMain.handle('doubao-test-text', async (e, prompt) => {
   let text;
   try { text = assertTheme(prompt); } catch (err) { return argFail(err); }
   if (!text) text = '你好，请只回复两个字：收到';
+  const cfg = await loadConfig();
+  const dcfg = cfg.doubao || {};
   try {
-    const r = await doubaoTransport.converse({ prompt: text, isImage: false, timeoutMs: 60000 });
-    return ok({ text: r.text, conversationId: r.conversationId, degraded: r.degraded });
+    const r = await doubaoTransport.converse({
+      prompt: text, isImage: false,
+      modelKey: dcfg.textModel, reasoningEffort: dcfg.reasoningEffort,
+      timeoutMs: 60000,
+    });
+    return ok({ text: r.text, conversationId: r.conversationId, degraded: r.degraded, model: dcfg.textModel || '0' });
   } catch (err) {
     return fail(doubaoProvider.humanize(err), ERROR_CODES.E_NET, { errorKind: err && err.kind });
   }
@@ -1135,13 +1175,14 @@ ipcMain.handle('doubao-test-image', async (e, prompt) => {
   if (!text) text = '一只白色的猫，坐姿，简洁背景，二次元风格';
   try {
     // 走 Provider 完整链路(含图片下载与格式校验),但不写壁纸目录、不触发换图。
-    const svc = { id: 'doubao-image' };
+    const cfg2 = await loadConfig();
+    const dcfg2 = cfg2.doubao || {};
     const res = await doubaoProvider.imageProvider.generate({
       config: { ai: { prompt: text } },
       doubao: { converse: (o) => doubaoTransport.converse(o) },
       netFetch,
       prompt: text,
-      serviceId: svc.id,
+      modelKey: dcfg2.textModel,       // 生图同样用选中的载体模型
       timeoutMs: 180000,
     });
     return ok({
@@ -1348,6 +1389,9 @@ if (!app.requestSingleInstanceLock()) {
     // 恢复上次已启用的外部插件。这是用户此前显式授权过的代码,重启后需要继续生效;
     // 但仍走一遍完整校验,插件被改动/损坏时按"跳过并记录"处理,不影响主程序启动。
     try { await restoreEnabledPlugins(); } catch {}
+    // 阶段3:恢复豆包登录状态。有凭据就置 authenticated,否则保持 idle。
+    // 必须在窗口创建之后调用,这样 onStateChange 能推送到渲染层。
+    try { await authManager.restore(); } catch (e) { /* 恢复失败不阻塞启动 */ }
     startWatcher();
   });
 }
