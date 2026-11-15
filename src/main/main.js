@@ -725,11 +725,32 @@ ipcMain.handle('change-wallpaper', (e, reason) => {
   }
   return changeWallpaper(r);
 });
+// 只读通道的失败记录(阶段2 第5步)
+// 问题背景:旧实现是 catch { return [] } —— 磁盘不可读与"目录本来就空"在渲染层完全同形,
+// 用户只会看到空列表,无从判断是没数据还是出了错。
+// 全面改返回形状(包 ok())需同步改 17 处 renderer 调用与 42 处测试断言,
+// 且这些通道本身无"业务失败"语义(见方案 §11 延期项说明),收益不抵风险。
+// 因此改为:保持返回形状不变(向后兼容),但把失败原因记录下来,经 get-status 暴露给 UI。
+const readErrors = { 'list-history': '', 'list-favorites': '', 'get-config': '', 'read-meta': '' };
+function noteReadError(channel, err) {
+  const msg = (err && err.message) ? err.message : String(err || '');
+  if (readErrors[channel] !== msg) readErrors[channel] = msg;
+}
+function clearReadError(channel) {
+  if (readErrors[channel]) readErrors[channel] = '';
+}
+
 ipcMain.handle('list-history', async () => {
   try {
     const files = (await fsp.readdir(wallDir())).filter(f => f.endsWith('.jpg')).sort().reverse();
+    clearReadError('list-history');
     return files.map(f => ({ name: f, path: path.join(wallDir(), f) }));
-  } catch { return []; }
+  } catch (err) {
+    // 目录不存在属于"首次使用,还没有壁纸"的正常状态,不算错误
+    if (err && err.code === 'ENOENT') { clearReadError('list-history'); return []; }
+    noteReadError('list-history', err);
+    return [];
+  }
 });
 ipcMain.handle('use-history', async (e, name) => {
   // 文件名必须是纯文件名:basename 已挡住路径穿越,这里再挡住非字符串入参
@@ -880,6 +901,10 @@ ipcMain.handle('get-status', async () => {
     lastInfo, nextRun, currentPath: currentPathStr,
     // 模型列表获取失败的原因(空串=无错误),渲染层据此给出明确提示,而不是只显示一个空下拉框
     imageModelsError,
+    // 只读通道的读取失败原因(阶段2 第5步)。
+    // 空对象=无错误。渲染层可据此区分"磁盘读不了"与"本来就没数据",
+    // 而不必改变各通道的返回形状(那样要动 17 处调用与 42 处断言)。
+    readErrors: Object.keys(readErrors).filter(k => readErrors[k]).reduce((acc, k) => { acc[k] = readErrors[k]; return acc; }, {}),
     sourceLabel: cfg.source === 'ai'
       ? ('当前来源: AI 生图 (' + (imgSvc?.name || '未配置') + ')')
       : '当前来源: Lolicon 随机二次元',
@@ -1221,8 +1246,12 @@ ipcMain.handle('list-favorites', async () => {
     const favDir = path.join(wallDir(), 'favorites');
     await fsp.mkdir(favDir, { recursive: true });
     const files = (await fsp.readdir(favDir)).filter(f => f.endsWith('.jpg')).sort().reverse();
+    clearReadError('list-favorites');
     return files.map(f => ({ name: f, path: path.join(favDir, f) }));
-  } catch { return []; }
+  } catch (err) {
+    noteReadError('list-favorites', err);
+    return [];
+  }
 });
 ipcMain.handle('delete-favorite', async (e, name) => {
   // basename 只能挡路径穿越,不能替代参数校验:

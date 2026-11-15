@@ -422,18 +422,34 @@ function setEmptyTip(box, text) {
   tip.textContent = text;
   box.appendChild(tip);
 }
+// 只读通道失败提示(阶段2 第5步):
+// 列表为空时再查一次 readErrors,区分"本来就没数据"与"磁盘读不了"。
+// 两者在旧实现里完全同形,用户只能看到空列表,无法判断出了什么问题。
+async function emptyTipOrError(box, channel, emptyText) {
+  let err = '';
+  try {
+    const st = await api.getStatus();
+    err = (st && st.readErrors && st.readErrors[channel]) || '';
+  } catch {}
+  if (err) {
+    setEmptyTip(box, '读取失败: ' + err + '(不是"没有数据",请检查壁纸目录是否可访问)');
+  } else {
+    setEmptyTip(box, emptyText);
+  }
+}
+
 async function loadHistory() {
   const files = await api.listHistory();
   const box = $('gallery');
   box.textContent = '';
-  if (!files || !files.length) { setEmptyTip(box, '暂无历史壁纸,点「立即换一张」开始 ✨'); return; }
+  if (!files || !files.length) { await emptyTipOrError(box, 'list-history', '暂无历史壁纸,点「立即换一张」开始 ✨'); return; }
   files.forEach(f => box.appendChild(makeGalleryItem(f)));
 }
 async function loadFavorites() {
   const files = await api.listFavorites();
   const box = $('fav-gallery');
   box.textContent = '';
-  if (!files || !files.length) { setEmptyTip(box, '暂无收藏 ♥ 主页右上角心形按钮可收藏当前壁纸'); return; }
+  if (!files || !files.length) { await emptyTipOrError(box, 'list-favorites', '暂无收藏 ♥ 主页右上角心形按钮可收藏当前壁纸'); return; }
   files.forEach(f => box.appendChild(makeGalleryItem(f, { showName: false, deletable: true })));
 }
 async function delFav(name) {
