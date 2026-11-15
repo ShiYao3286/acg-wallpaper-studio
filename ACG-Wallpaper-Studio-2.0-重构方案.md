@@ -404,4 +404,118 @@ docs/
 - latest.yml 中的安装包 URL 与实际中文安装包文件名不一致，接入 autoUpdater 前必须修复。
 - PowerShell 5.1 写入 JSON 的 BOM 兼容问题必须在旧脚本兼容测试中覆盖。
 
-执行纪律：阶段 1 已完成实现，通过小白龙三轮独立代码审核，并完成最终验收（454/454）。**工作区改动尚未提交，提交需单独授权。** 进入阶段 2 前，本文档「阶段 1 未完成/延期」表中的各项必须先确认归属，不得在阶段 2 交付中被当作已完成。若实际代码、接口或数据格式与规划不符，先记录差异并确认迁移策略，不得静默破坏兼容性。
+执行纪律：阶段 1 已完成实现，通过小白龙三轮独立代码审核，完成最终验收（454/454），并已提交推送（`10905da`、`7f6db8e`）。进入阶段 2 前，本文档「阶段 1 未完成/延期」表中的各项必须先确认归属，不得在阶段 2 交付中被当作已完成。若实际代码、接口或数据格式与规划不符，先记录差异并确认迁移策略，不得静默破坏兼容性。
+
+---
+
+## 十二、阶段 2 实施计划（插件系统 + 阶段 1 延期项）
+
+### 12.1 现状核对（动手前实测）
+
+| 项 | 实测结果 |
+|---|---|
+| Provider / 插件实现 | **零**。在 `src/` 中搜索 provider、plugin、manifest 无任何匹配 |
+| 硬编码的调用点 | `fetchLolicon()`（main.js:113-126）、`fetchAI()`（189-210）、`test-service` 三分支（946）、`fetch-models`（995）、`ai-assist-prompt`（1037） |
+| 服务数据模型 | `{ id, kind, name, apiBase, apiKey, model }`，`kind` 仅 `image` / `text` |
+| 内联事件 | **onclick 29 + onchange 9 = 38 处**（此前只记录 onclick 29，口径不完整） |
+| CSP | 无。`index.html` 只有一行 `<script src="renderer.js"></script>` |
+
+**关键判断**：当前两个「引擎」是直接写在 `main.js` 里的函数，没有抽象层。插件系统的第一步不是「加插件」，而是**先把引擎收敛成统一的 Provider 接口**，否则插件协议无处挂载。
+
+### 12.2 目标结构
+
+```text
+src/main/plugins/
+  provider-protocol.js        协议定义 + 能力声明 + 校验
+  provider-registry.js        注册 / 发现 / 启用 / 停用 / 查询
+  builtin/
+    lolicon-provider.js       从 fetchLolicon 抽取
+    openai-image-provider.js  从 fetchAI 抽取
+    openai-text-provider.js   从 ai-assist-prompt 抽取
+```
+
+Provider 协议草案：
+
+```js
+{
+  id: 'lolicon',
+  name: 'Lolicon 随机二次元',
+  version: '1.0.0',
+  kind: 'image-source',          // image-source | image-gen | text
+  capabilities: ['fetch-random'],
+  configSchema: { /* 供 UI 渲染的字段声明 */ },
+  async fetch(ctx) { /* 返回 { buffer, meta } 或 { url, meta } */ }
+}
+```
+
+**权限边界**：Provider 不得直接 `require('electron')` 或读写文件系统，只能通过 `ctx` 注入的能力（`netFetch`、`config`）做事。
+
+### 12.3 执行顺序（低风险优先，高风险最后）
+
+| 序 | 内容 | 风险 | 验证方式 |
+|---|---|---|---|
+| 1 | Provider 协议 + registry（纯新增文件，不接入） | 低 | 单元测试 |
+| 2 | 接入 `fetchLolicon` / `fetchAI` / `ai-assist-prompt` 三个调用点 | 中 | 454 项回归 |
+| 3 | CSP（38 处内联事件改 `addEventListener`） | 中 | 实机冷启动 CDP |
+| 4 | 插件发现与生命周期 | 中 | 新增测试 |
+| 5 | 统一只读通道返回格式 | 中 | 454 项 + renderer 调用点 |
+| 6 | `wallpaper-service` 拆分 | **高** | 454 项 + 真实换图 |
+
+每步一个 commit，提交前跑满全部测试。第 1-2 步先做，跑通后再评估后续。
+
+### 12.4 本轮范围与明确不做
+
+**本轮（第 1-2 步）**：Provider 协议、registry、3 个内置 Provider、接入 3 个调用点、新增 t13 测试。
+
+**明确不做**：豆包 Provider（阶段 3）、SQLite（阶段 5）、插件热重载、第三方插件生态、CSP、只读通道统一格式、`wallpaper-service` 拆分（均属后续步骤）。
+
+### 12.5 阶段 2 验收标准（第 1-2 步）
+
+- Provider 协议有明确的字段校验，坏 Provider 对象被拒绝且不崩溃
+- registry 支持注册、按 kind 查询、按 id 获取、列出全部
+- 3 个内置 Provider 通过 registry 可获取，且行为与原实现**完全一致**
+- 原 454 项测试全通过（证明接入未改变行为）
+- 新增测试覆盖协议校验、registry 行为、Provider 基本契约
+- 真实 Electron 启动正常，`exceptionThrown=0`、`console.error=0`
+
+### 12.6 第 1-2 步完成情况（2026-11-15）
+
+**已完成**：
+
+| 交付项 | 文件 | 说明 |
+|---|---|---|
+| Provider 协议 | `src/main/plugins/provider-protocol.js` | 3 种 kind、5 种 capability、每种 kind 的必需能力校验、id 字符集限制（防目录穿越）、configSchema 形状校验 |
+| 注册表 | `src/main/plugins/provider-registry.js` | register / registerAll / get / getMeta / listByKind / list / setEnabled / isEnabled |
+| 内置 Provider | `src/main/plugins/builtin/lolicon-provider.js` | 从 `fetchLolicon()` 原样迁移 |
+| 内置 Provider | `src/main/plugins/builtin/openai-image-provider.js` | 从 `fetchAI()` 原样迁移 |
+| 内置 Provider | `src/main/plugins/builtin/openai-text-provider.js` | 从 `ai-assist-prompt()` 文本分支原样迁移 |
+| 接入 | `src/main/main.js` | 三个调用点改为委托 Provider；模块加载时 `registerAll` |
+| 测试 | `tests/t13-provider.js` | 43 项，四组 A/B/C/D |
+
+**过程中发现并修正的设计缺陷**：
+
+`registry` 是模块级单例，而 `main.js` 会在同一进程内被多次加载（测试脚手架 `Module._load` 钩子反复 `loadMain`、热重载同理）。初版实现「重复 id 直接抛错」导致第二次加载 `main.js` 即启动失败，7 个测试组 CRASH。已改为**按 id 幂等覆盖**：同 id 再次注册校验通过后替换实现；「同一批内重复 id」仍由 `registerAll` 拦截。
+
+**测试结果**：
+
+```
+全量: 13 个测试文件, 497 项断言, 497 通过, 0 失败, 43.4s
+（原 454 项 + 新增 t13 43 项）
+node --check: 35 个 JS 文件全部通过
+```
+
+**真实 Electron 33.4.11 验证**：
+
+```
+窗口: ACG壁纸工作室 v1.3.1     API 键数: 30
+状态: 当前来源 Lolicon 随机二次元, current 存在
+list-services: 2 个 (image: 默认生图服务 / text: 提示词)
+roll-random-prompt: 成功,生成完整 Danbooru 标签串
+ai-assist-prompt: ok=true, local=false, 长度 519
+  → 走的是激活的文本服务 trae/deepseek-v4.1-flash, 证明 openai-text Provider 路由正确
+运行时错误: 无 exceptionThrown, 无 console.error
+```
+
+**用户数据**：12 个文件 SHA256 与基线逐字节一致；无 `.tmp` 残留；无 electron 残留进程。
+
+**未做（属后续步骤）**：插件发现与生命周期（第 4 步）、CSP（第 3 步）、统一只读通道格式（第 5 步）、`wallpaper-service` 拆分（第 6 步）。

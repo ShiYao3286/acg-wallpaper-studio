@@ -13,6 +13,11 @@ const { assertService, assertPreset, assertId, assertKind, assertReason, assertA
 const configService = require('./services/config-service');
 const scheduler = require('./system/scheduler');
 const trayMod = require('./system/tray');
+// 阶段2:Provider 插件系统。内置 Provider 与未来外部插件走同一套协议与注册表。
+const providerRegistry = require('./plugins/provider-registry');
+const loliconProvider = require('./plugins/builtin/lolicon-provider');
+const openaiImageProvider = require('./plugins/builtin/openai-image-provider');
+const openaiTextProvider = require('./plugins/builtin/openai-text-provider');
 
 let win = null;
 let tray = null;
@@ -74,6 +79,19 @@ function releaseChanging() {
   changing = false;
 }
 
+// ---------- Provider 注册(阶段2) ----------
+// 在模块加载阶段完成注册,先于任何 IPC handler 与换图流程,
+// 保证后续 providerRegistry.get() 一定拿得到内置实现。
+// 用 registerAll 一次性注册:任一内置 Provider 协议不合规会立即抛错,
+// 使"内置实现写坏了"在启动时就暴露,而不是等到用户点「立即换一张」。
+try {
+  providerRegistry.registerAll([loliconProvider, openaiImageProvider, openaiTextProvider]);
+} catch (err) {
+  // 注册失败属于开发期错误(内置 Provider 不该校验不过),
+  // 这里不吞掉:直接抛出,让启动失败并暴露问题,避免带病运行。
+  throw new Error('内置 Provider 注册失败: ' + ((err && err.message) || err));
+}
+
 // ---------- 配置存取 ----------
 // 实现已迁至 services/config-service.js;这里只做转发 + 保存后重新应用调度。
 // applySchedule 是副作用,留在 main.js 触发,使 config-service 不需要反向依赖 scheduler。
@@ -111,18 +129,12 @@ async function gameRunning(cfg) {
 }
 
 // ---------- 引擎 1: Lolicon 随机二次元 ----------
+// 阶段2起实现迁移到 plugins/builtin/lolicon-provider.js,
+// 本函数只做"取 Provider + 注入能力"的分发,行为与迁移前完全一致。
 async function fetchLolicon(cfg) {
-  const L = cfg.lolicon;
-  const tags = Array.isArray(L.tags) ? L.tags.filter(Boolean) : [];
-  const tag = tags.length ? tags[Math.floor(Math.random() * tags.length)] : null;
-  const url = L.apiBase + '?num=1&r18=' + L.r18 + '&size=' + L.size + '&proxy=' + L.proxy +
-    (L.excludeAI ? '&excludeAI=true' : '') + (tag ? '&tag=' + encodeURIComponent(tag) : '');
-  const res = await netFetch(url, { signal: AbortSignal.timeout(30000) });
-  if (!res.ok) throw new Error('API HTTP ' + res.status);
-  const json = await res.json();
-  const d = json.data && json.data[0];
-  if (!d || !d.urls || !d.urls.regular) throw new Error('API 未返回图片地址');
-  return { url: d.urls.regular, title: d.title, author: d.author, pid: d.pid, tag };
+  const provider = providerRegistry.get('lolicon');
+  if (!provider) throw new Error('内置 Provider 不可用: lolicon');
+  return await provider.fetch({ config: cfg, netFetch });
 }
 
 // ---------- 引擎 2: AI 生图 ----------
@@ -186,27 +198,19 @@ function classifyError(e) {
   return ERROR_CODES.E_IO;
 }
 
+// 阶段2起实现迁移到 plugins/builtin/openai-image-provider.js。
+// 注意返回契约:Provider 返回 { buffer },本函数解包成 Buffer 保持调用方不变。
 async function fetchAI(cfg, serviceId, finalPrompt) {
-  const svc = findService(cfg, serviceId || cfg.activeImageService);
-  if (!svc) throw new Error('未找到画图 API 服务,请到「API 服务」页配置');
-  const base = apiBase(svc.apiBase);
-  const res = await netFetch(base + '/v1/images/generations', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + svc.apiKey, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: svc.model, prompt: finalPrompt || cfg.ai.prompt, n: 1, size: cfg.ai.size }),
-    signal: AbortSignal.timeout(180000),
+  const provider = providerRegistry.get('openai-image');
+  if (!provider) throw new Error('内置 Provider 不可用: openai-image');
+  const res = await provider.generate({
+    config: cfg,
+    netFetch,
+    findService,
+    serviceId,
+    prompt: finalPrompt,
   });
-  if (!res.ok) throw new Error('AI API HTTP ' + res.status + ': ' + (await res.text()).slice(0, 200));
-  const json = await res.json();
-  const item = json.data && json.data[0];
-  if (!item) throw new Error('AI API 未返回数据');
-  if (item.b64_json) return Buffer.from(item.b64_json, 'base64');
-  if (item.url) {
-    const r2 = await netFetch(item.url, { signal: AbortSignal.timeout(60000) });
-    if (!r2.ok) throw new Error('下载 AI 图片失败 HTTP ' + r2.status);
-    return Buffer.from(await r2.arrayBuffer());
-  }
-  throw new Error('AI API 响应中无图片');
+  return res.buffer;
 }
 
 // ---------- 核心: 换壁纸流程 ----------
@@ -1034,20 +1038,21 @@ ipcMain.handle('ai-assist-prompt', async (e, userTheme) => {
     return { ok: true, prompt: parts.join(', '), local: true };
   }
   try {
-    const base = apiBase(textSvc.apiBase);
+    // 阶段2起实现迁移到 plugins/builtin/openai-text-provider.js
+    const provider = providerRegistry.get('openai-text');
+    if (!provider) return { ok: false, error: '内置 Provider 不可用: openai-text' };
     const sys = '你是二次元壁纸提示词专家。把用户主题扩写成高质量英文 Danbooru 标签串(逗号分隔,含画质/构图/光线/场景词),不要解释,只输出标签串。可参考这些标签池元素: ' + tags;
-    const res = await netFetch(base + '/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + textSvc.apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: textSvc.model, messages: [
+    return await provider.complete({
+      config: cfg,
+      netFetch,
+      findService,
+      serviceId: cfg.activeTextService,
+      maxTokens: 300,
+      messages: [
         { role: 'system', content: sys },
-        { role: 'user', content: theme || '随机来一张好看的壁纸' }], max_tokens: 300 }),
-      signal: AbortSignal.timeout(60000),
+        { role: 'user', content: theme || '随机来一张好看的壁纸' },
+      ],
     });
-    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ': ' + (await res.text()).slice(0, 150) };
-    const data = await res.json();
-    const text = data.choices?.[0]?.message?.content?.trim();
-    return text ? { ok: true, prompt: text, local: false } : { ok: false, error: '模型返回为空' };
   } catch (err) {
     return { ok: false, error: err.message };
   }
