@@ -108,17 +108,34 @@ function mkProvider(id, builtin) {
       })();
       ok('G13', 'registerAll 与已有 registry 冲突时整体失败', !!threw && protocol.isProtocolError(threw),
         threw ? threw.message : '未抛错');
-      ok('G13b', '失败后前一个新 Provider 未被部分注册', !reg2.has('new-one') && reg2.size() === sizeBefore,
-        'size=' + reg2.size() + ' (期望 ' + sizeBefore + ')');
-      // 注意:get() 在 disabled 状态下返回 null,因此这里不能用 get() 比引用。
-      // 先恢复 enabled 拿到实现引用做比对,再置回 disabled 保持后续状态断言的前提。
+
+      // 关键:必须在任何 setEnabled() 之前读取失败后的真实状态。
+      // 若先调 setEnabled 再断言,测的就是"测试代码恢复后的状态",而不是 registerAll 造成的状态,
+      // 那样即使 registerAll 意外改了 enabled 也会被掩盖。
+      const enabledAfterFailure = reg2.isEnabled('existing-bi');
+      const sizeAfterFailure = reg2.size();
+      const hasNewAfterFailure = reg2.has('new-one');
+
+      ok('G13b', '失败后前一个新 Provider 未被部分注册', !hasNewAfterFailure,
+        'has(new-one)=' + hasNewAfterFailure);
+      ok('G13b2', '失败后 registry 总数量不变', sizeAfterFailure === sizeBefore,
+        sizeAfterFailure + ' (期望 ' + sizeBefore + ')');
+      ok('G13e', '失败后 enabled/disabled 状态未被改动(在任何 setEnabled 之前读取)',
+        enabledAfterFailure === enabledBefore,
+        '期望 ' + enabledBefore + ' 实际(失败后立即读) ' + enabledAfterFailure);
+
+      const metaAfterFailure = reg2.getMeta('existing-bi');
+      ok('G13d', '失败后原有 Provider 元数据不变',
+        JSON.stringify(metaAfterFailure) === JSON.stringify(metaBefore));
+
+      // 引用比对需要 get(),而 get() 在 disabled 时返回 null。
+      // 临时启用取引用,随后恢复到失败前的原始状态 enabledBefore(而非硬编码 false)。
       reg2.setEnabled('existing-bi', true);
       const implAfter = reg2.get('existing-bi');
-      reg2.setEnabled('existing-bi', false);
+      reg2.setEnabled('existing-bi', enabledBefore);
       ok('G13c', '失败后原有 Provider 实现引用不变', implAfter === implBefore,
-        'disabled 时 get() 返回 null,故先临时启用再比对');
-      ok('G13d', '失败后原有 Provider 元数据不变', JSON.stringify(reg2.getMeta('existing-bi')) === JSON.stringify(metaBefore));
-      ok('G13e', '失败后 enabled/disabled 状态不变', reg2.isEnabled('existing-bi') === enabledBefore,
+        'disabled 时 get() 返回 null,故临时启用取引用后已恢复原状态');
+      ok('G13f', '恢复后最终 enabled 状态仍等于失败前', reg2.isEnabled('existing-bi') === enabledBefore,
         '期望 ' + enabledBefore + ' 实际 ' + reg2.isEnabled('existing-bi'));
     }
     // ---------- G14: 内置 Provider 严格幂等(不替换实现、不动状态) ----------
@@ -181,14 +198,18 @@ function mkProvider(id, builtin) {
 
   // ========== H. 插件符号链接安全 ==========
   group('H 插件符号链接安全');
-  {
-    const loader = require(path.join(PLUGINS, 'plugin-loader.js'));
-    const os = require('node:os');
-    const { execFileSync } = require('node:child_process');
+  // try/finally:中途任何断言失败或抛异常,H 组自己创建的临时目录仍会被清理。
+  // 只删除本组 mkRoot() 产生的目录,不触碰 %TEMP% 下其他 acg-* 历史目录。
+  // 辅助函数与 tmpRoots 必须在 try 之外声明,否则 finally 拿不到 cleanup。
+  const loader = require(path.join(PLUGINS, 'plugin-loader.js'));
+  const os = require('node:os');
+  const { execFileSync } = require('node:child_process');
 
-    const tmpRoots = [];
-    const mkRoot = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'acg-h17-')); tmpRoots.push(d); return d; };
-    const cleanup = () => { for (const d of tmpRoots) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} } };
+  const tmpRoots = [];
+  const mkRoot = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'acg-h17-')); tmpRoots.push(d); return d; };
+  const cleanup = () => { for (const d of tmpRoots) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} } };
+
+  try {
 
     const MANIFEST = { id: 'demo', name: 'demo', version: '1.0.0', kind: 'image-source', capabilities: ['fetch-random'] };
     const ENTRY = "module.exports = { async fetch(ctx){ return { url: 'http://x/y.jpg' }; } };";
@@ -296,13 +317,18 @@ function mkProvider(id, builtin) {
         '即使目标在目录内也拒绝,语义更明确:用户放了什么文件就是什么文件');
     }
 
-    // ---------- H6:循环符号链接 ----------
-    // 旧版本缺陷:manifest 没写 main,加载器默认查 index.js,
-    // 而本用例只造了 a.js/b.js 互链 —— 于是根本没走到循环链接就结束了,
-    // 断言"被跳过"其实是被"入口文件不存在"跳过的,测的不是循环链接。
-    // 现在 manifest.main 明确指向 a.js,保证加载器真的去访问循环链接。
+    // ---------- H6:循环符号链接入口在跟随前被拒绝 ----------
+    // 语义说明(重要,勿再误解):
+    //   本用例验证的是「入口文件是符号链接 -> 在跟随之前就被拒绝」,
+    //   而【不是】验证"realpath 跟随循环链接时触发 ELOOP"的行为。
+    //   加载器在 resolveEntry() 里先用 lstatSync 判 isSymbolicLink(),
+    //   符号链接在跟随之前就已返回拒绝原因,根本不会走到 realpath 跟随。
+    //   这是安全策略上的"前置拒绝",不是"跟随失败后的兜底"。
+    //
+    //   仍用 a.js<->b.js 互链 + manifest.main=a.js,是为了确保被拒绝的确实是
+    //   指向循环的入口文件,而不是因入口缺失提前结束(旧版本正是踩了这个坑)。
     if (!symlinkFileOk) {
-      skip('H6', '循环符号链接不崩溃', '本机无法创建文件符号链接(需开发者模式或管理员权限),待补测');
+      skip('H6', '循环符号链接入口在跟随前被拒绝', '本机无法创建文件符号链接(需开发者模式或管理员权限),待补测');
       skip('H6b', '拒绝原因是入口为符号链接', '同上:前置条件不足,未执行');
     } else {
       const base = mkRoot();
@@ -316,10 +342,10 @@ function mkProvider(id, builtin) {
       fs.symlinkSync(path.join(dir, 'b.js'), path.join(dir, 'a.js'), 'file');
       fs.symlinkSync(path.join(dir, 'a.js'), path.join(dir, 'b.js'), 'file');
       const r = loader.discover(root2);
-      ok('H6', '循环符号链接被安全拒绝且不崩溃', r.found.length === 0 && r.skipped.length === 1,
+      ok('H6', '循环符号链接入口在跟随前被拒绝', r.found.length === 0 && r.skipped.length === 1,
         'skipped=' + JSON.stringify(r.skipped.map(x => x.reason)));
       // 断言拒绝原因确实是"入口是符号链接",而不是别的偶发原因
-      ok('H6b', '拒绝原因是入口为符号链接(main 已指向循环链接,确系触发了目标路径)',
+      ok('H6b', '拒绝原因是入口为符号链接(main 已指向循环链接,确系命中了目标入口)',
         r.skipped.length === 1 && /符号链接/.test(r.skipped[0].reason),
         'reason=' + (r.skipped[0] ? r.skipped[0].reason : 'n/a'));
     }
@@ -356,6 +382,7 @@ function mkProvider(id, builtin) {
       })(), '真目录 true / junction false / isSymlink 能识别');
     }
 
+  } finally {
     cleanup();
   }
 
@@ -365,7 +392,9 @@ function mkProvider(id, builtin) {
     const os = require('node:os');
     const { loadMain, waitBoot, closeAllWatchers } = require('./harness');
 
+    // 辅助声明放在 try 之外,保证 finally 能访问 cleanup
     const tmpRoots = [];
+    const cleanupK = () => { for (const d of tmpRoots) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} } };
     async function mkEnv() {
       const base = fs.mkdtempSync(path.join(os.tmpdir(), 'acg-k17-'));
       tmpRoots.push(base);
@@ -380,6 +409,8 @@ function mkProvider(id, builtin) {
       const call = async (ch, ...a) => { const fn = loaded.state.ipcHandlers.get(ch); return await fn({}, ...a); };
       return { base, userData, pictures, wallDir, confDir, confFile: path.join(confDir, 'config.json'), call };
     }
+
+    try {
 
     // ---------- K1 正常无错误 ----------
     {
@@ -416,7 +447,7 @@ function mkProvider(id, builtin) {
       closeAllWatchers();
     }
 
-    // ---------- K6 history.jsonl 被目录占据(EISDIR/ENOTDIR) ----------
+    // ---------- K6 history.jsonl 被目录占据(EISDIR) ----------
     {
       const e = await mkEnv();
       fs.mkdirSync(path.join(e.wallDir, 'history.jsonl'));
@@ -478,7 +509,13 @@ function mkProvider(id, builtin) {
       closeAllWatchers();
     }
 
-    for (const d of tmpRoots) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  } finally {
+    // try/finally:中途任何断言失败或抛异常,K 组自己创建的临时目录仍会被清理。
+    // 先关 watcher 再删目录,避免 libuv 句柄未释放导致删除失败。
+    // 只删除本组 mkNew() 产生的目录,不触碰 %TEMP% 下其他 acg-* 历史目录。
+    try { closeAllWatchers(); } catch {}
+    cleanupK();
+  }
   }
 
   const s = summarize();
