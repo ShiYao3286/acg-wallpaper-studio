@@ -270,6 +270,128 @@ function mkSafe(o) {
     ok('F6', 'main.js 不再使用旧的 hostname 后缀正则', !/\/\(\.\|\^\)\.\$\//.test(mainSrc2) && !/\(\.\|\^\)doubao/.test(mainSrc2));
   }
 
+  // ==========================================================================
+  // H 组 —— 阶段3 审核修复:风险确认由【主进程】统一把关
+  //
+  // 这一组走的是【真实 main.js 的 IPC handler】,不是重写的假逻辑:
+  // 通过 tests/harness 加载真实 src/main/main.js,拿到它注册的 handler 直接调用。
+  // 对应问题:doubao-login 原来完全没查 hasAcceptedDoubaoRisk,而 Renderer
+  // 真正调用的就是它 —— 真实 UI 路径绕过了风险确认。
+  //
+  // 诚实声明:这里的 Electron 平台 API 是 mock(窗口/session/safeStorage),
+  // 不发起任何真实网络请求,也不使用真实豆包账号。
+  // 它证明的是"主进程 IPC 的判定逻辑正确",不是"真实登录能跑通"。
+  // ==========================================================================
+  group('H 风险确认 IPC(真实 main.js)');
+  {
+    const { loadMain, waitBoot, closeAllWatchers } = require('./harness');
+    const { mkTmp } = require('./common');
+    const root = mkTmp('acg-t18-risk-');
+    const userData = path.join(root, 'userData');
+    const pictures = path.join(root, 'Pictures');
+    fs.mkdirSync(userData, { recursive: true });
+    fs.mkdirSync(path.join(pictures, 'ACG_Wallpaper'), { recursive: true });
+    const loaded = loadMain({ userDataDir: userData, picturesDir: pictures, holdReady: false, singleInstanceLock: true });
+    await waitBoot(loaded.state, 5000);
+    const call = async (chan, ...args) => {
+      const fn = loaded.state.ipcHandlers.get(chan);
+      if (!fn) throw new Error('通道未注册: ' + chan);
+      return await fn({}, ...args);
+    };
+    // 重置风险确认状态,保证用例之间互不影响
+    await call('doubao-accept-risk', false);
+
+    const login0 = await call('doubao-login');
+    ok('H1', '未确认风险时 doubao-login 明确失败',
+      login0 && login0.ok === false && /风险/.test(String(login0.error)), JSON.stringify(login0).slice(0, 120));
+
+    const open0 = await call('doubao-open-login-window');
+    ok('H2', '未确认风险时 doubao-open-login-window 明确失败',
+      open0 && open0.ok === false && /风险/.test(String(open0.error)));
+
+    ok('H3', '未确认风险时没有创建任何登录窗口',
+      !loaded.state.browserWindowOptions.some(o => o && o.title === '豆包登录'),
+      '窗口数=' + loaded.state.browserWindowOptions.length);
+
+    ok('H4', '未确认风险时没有创建豆包专属 partition',
+      !loaded.electron.__sessionState.createdPartitions.includes('persist:doubao'),
+      '已建分区: ' + loaded.electron.__sessionState.createdPartitions.join(',') || '(无)');
+
+    const t0 = await call('doubao-test-text', '你好');
+    ok('H5', '未确认风险时 doubao-test-text 被拒绝(额度入口不绕过风险告知)',
+      t0 && t0.ok === false && /风险/.test(String(t0.error)), JSON.stringify(t0).slice(0, 100));
+
+    const i0 = await call('doubao-test-image', '一只猫');
+    ok('H6', '未确认风险时 doubao-test-image 被拒绝',
+      i0 && i0.ok === false && /风险/.test(String(i0.error)));
+
+    // 确认风险后,登录入口应放行(会真的走到 openLoginWindow)
+    await call('doubao-accept-risk', true);
+    const riskNow = await call('doubao-risk-accepted');
+    ok('H7', '确认后主进程风险状态为 true', riskNow && riskNow.accepted === true);
+
+    const login1 = await call('doubao-login');
+    ok('H8', '确认风险后 doubao-login 不再被风险拦住',
+      !(login1 && login1.ok === false && /风险/.test(String(login1.error))),
+      JSON.stringify(login1).slice(0, 120));
+
+    const open1 = await call('doubao-open-login-window');
+    ok('H9', '确认风险后 doubao-open-login-window 不再被风险拦住',
+      !(open1 && open1.ok === false && /风险/.test(String(open1.error))));
+
+    // 两个登录入口必须共用同一道校验:取消确认后两者都要重新拦住
+    await call('doubao-accept-risk', false);
+    const login2 = await call('doubao-login');
+    const open2 = await call('doubao-open-login-window');
+    ok('H10', '两个登录入口共用同一校验(取消确认后同时失效)',
+      login2 && login2.ok === false && /风险/.test(String(login2.error)) &&
+      open2 && open2.ok === false && /风险/.test(String(open2.error)));
+
+    ok('H11', 'doubao-accept-risk 拒绝非布尔参数',
+      (await call('doubao-accept-risk', 'yes')).ok === false);
+
+    // 登录窗口的导航拦截:用真实 will-navigate 回调验证
+    await call('doubao-accept-risk', true);
+    await call('doubao-login');
+    const win = loaded.state.windows.find(w => w && w.options && w.options.title === '豆包登录');
+    ok('H12', '登录窗口已创建且加载了正确的登录 URL',
+      !!win && win.loadedUrl === ap.LOGIN_URL,
+      win ? String(win.loadedUrl) : '(未找到窗口)');
+
+    const navCases = [
+      ['https://www.doubao.com/chat/', false],
+      ['https://passport.doubao.com/x', false],
+      ['http://www.doubao.com/', true],
+      ['https://evil-doubao.com/', true],
+      ['https://doubao.com.evil.test/', true],
+      ['https://notdoubao.com/', true],
+    ];
+    const navResults = navCases.map(([u]) => {
+      let prevented = false;
+      win.webContents.emit('will-navigate', { preventDefault: () => { prevented = true; } }, u);
+      return { u, prevented };
+    });
+    ok('H13', '合法豆包地址不被拦截', navResults.filter(r => !r.prevented).length === 2,
+      navResults.filter(r => !r.prevented).map(r => r.u).join(','));
+    ok('H14', '非 https 与相似域名全部被拦截',
+      navResults.filter(r => r.u !== 'https://www.doubao.com/chat/' && r.u !== 'https://passport.doubao.com/x')
+        .every(r => r.prevented),
+      navResults.filter(r => r.prevented).map(r => r.u).join(','));
+
+    const denyHandler = win._windowOpenHandler;
+    ok('H15', 'window.open 一律 deny', (() => {
+      const r = denyHandler && denyHandler({ url: 'https://www.doubao.com/chat/' });
+      return !!r && r.action === 'deny';
+    })());
+
+    // status 通道不得泄露凭据
+    const st = await call('doubao-status');
+    const stStr = JSON.stringify(st);
+    ok('H16', 'doubao-status 不返回任何 Cookie 值',
+      !/sessionid|ttwid|odin_tt|s_v_web_id/.test(stStr) && typeof st.state === 'string',
+      stStr.slice(0, 120));
+  }
+
   group('D Provider 协议兼容');
   {
     const lol = require(path.join(ROOT, 'src', 'main', 'plugins', 'builtin', 'lolicon-provider.js'));

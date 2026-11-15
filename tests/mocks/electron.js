@@ -35,10 +35,25 @@ class BrowserWindow {
     this._focused = false;
     this._events = new Map();
     this.sentMessages = [];
-    this.webContents = { send: (channel, payload) => { this.sentMessages.push({ channel, payload }); } };
+    const wcEvents = new Map();
+    this._wcEvents = wcEvents;
+    this.webContents = {
+      send: (channel, payload) => { this.sentMessages.push({ channel, payload }); },
+      on: (ev, cb) => { wcEvents.set(ev, cb); },
+      once: (ev, cb) => { wcEvents.set(ev, cb); },
+      emit: (ev, ...args) => { const cb = wcEvents.get(ev); if (cb) cb(...args); },
+      setWindowOpenHandler: (fn) => { this._windowOpenHandler = fn; },
+      getURL: () => this.loadedUrl || '',
+    };
     state.windows.push(this);
   }
   loadFile() { this.loadedFile = arguments[0]; return Promise.resolve(); }
+  loadURL(u) {
+    this.loadedUrl = u;
+    // 登录窗口的 will-navigate 拦截器需要 webContents.on,
+    // 这里一并记录事件回调,供导航白名单测试直接触发。
+    return Promise.resolve();
+  }
   once(ev, cb) { this._events.set(ev, cb); }
   on(ev, cb) { this._events.set(ev, cb); }
   show() { this._visible = true; }
@@ -60,6 +75,97 @@ class Tray {
   isDestroyed() { return this._destroyed; }
   destroy() { this._destroyed = true; this.destroyed = true; }
 }
+
+// ---------------------------------------------------------------------------
+// session / safeStorage 模拟(阶段3 豆包登录链路需要)
+//
+// 这两块是 Electron 平台 API,不是被测的生产逻辑,因此在 mock 层替换。
+// 刻意做成"可编程的假实现":测试可以注入 Cookie 列表、让 remove 抛错、
+// 让 safeStorage 不可用,从而覆盖真实环境里很难复现的失败分支。
+//
+// 注意:这里【不模拟真实网络与真实登录】。凡是标注"mock"的用例,
+// 都不代表真实豆包账号能跑通 —— 真实账号验证是独立的人工步骤。
+// ---------------------------------------------------------------------------
+const sessionState = {
+  partitions: new Map(),   // partition -> ses 对象
+  createdPartitions: [],   // 创建顺序,便于断言"只建了一个豆包分区"
+};
+
+// 每个 partition 一个独立 cookie jar:Map<"domain|path|name", {name,value,domain,path,secure}>
+function mkSession(partition) {
+  const jar = new Map();
+  const key = (c) => String(c.domain || '').replace(/^\./, '') + '|' + (c.path || '/') + '|' + c.name;
+  const ses = {
+    partition,
+    cookies: {
+      // get({url}) 按 domain 后缀匹配,贴近 Electron 的真实语义
+      async get(filter) {
+        const opt = filter || {};
+        if (opt.url) {
+          let host = '';
+          try { host = new URL(opt.url).hostname; } catch { return []; }
+          const out = [];
+          for (const c of jar.values()) {
+            const d = String(c.domain || '').replace(/^\./, '');
+            if (host === d || host.endsWith('.' + d)) out.push({ ...c });
+          }
+          return out;
+        }
+        return [...jar.values()].map(c => ({ ...c }));
+      },
+      async remove(url, name) {
+        if (sessionState.removeThrows) throw new Error('mock cookies.remove 失败');
+        let host = '';
+        try { host = new URL(url).hostname; } catch { return; }
+        for (const [k, c] of jar) {
+          const d = String(c.domain || '').replace(/^\./, '');
+          if ((host === d || host.endsWith('.' + d)) && c.name === name) { jar.delete(k); return; }
+        }
+      },
+      async set(domain, name, value, opts) {
+        const o = opts || {};
+        const c = { name, value, domain, path: o.path || '/', secure: o.secure !== false };
+        jar.set(key(c), c);
+      },
+      async flushStore() { if (sessionState.flushThrows) throw new Error('mock flushStore 失败'); },
+      __jar: jar,
+    },
+    __seed(list) { for (const c of list) jar.set(key(c), { ...c }); },
+    __dump() { return [...jar.values()].map(c => c.name); },
+  };
+  return ses;
+}
+
+const session = {
+  fromPartition: (partition) => {
+    if (!sessionState.partitions.has(partition)) {
+      sessionState.partitions.set(partition, mkSession(partition));
+      sessionState.createdPartitions.push(partition);
+    }
+    return sessionState.partitions.get(partition);
+  },
+  defaultSession: null,
+};
+session.defaultSession = mkSession('__default__');
+
+const safeStorageState = { available: true, failEncrypt: false, failDecrypt: false };
+const SAFE_KEY = Buffer.from('acg-test-safe-key-0123456789abcdef');
+function safeXform(buf) {
+  const out = Buffer.alloc(buf.length);
+  for (let i = 0; i < buf.length; i++) out[i] = buf[i] ^ SAFE_KEY[i % SAFE_KEY.length];
+  return out;
+}
+const safeStorage = {
+  isEncryptionAvailable: () => safeStorageState.available,
+  encryptString: (s) => {
+    if (safeStorageState.failEncrypt) throw new Error('mock encrypt 失败');
+    return safeXform(Buffer.from(s, 'utf8'));
+  },
+  decryptString: (b) => {
+    if (safeStorageState.failDecrypt) throw new Error('mock decrypt 失败');
+    return safeXform(b).toString('utf8');
+  },
+};
 
 const app = {
   requestSingleInstanceLock: () => state.singleInstanceLock,
@@ -92,4 +198,18 @@ const nativeImage = {
   createFromBuffer: () => ({ isEmpty: () => false }),
 };
 
-module.exports = { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, __state: state, __init };
+module.exports = {
+  app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, session, safeStorage,
+  __state: state, __init,
+  __sessionState: sessionState,
+  __safeStorageState: safeStorageState,
+  __resetSessionState: () => {
+    sessionState.partitions.clear();
+    sessionState.createdPartitions.length = 0;
+    sessionState.removeThrows = false;
+    sessionState.flushThrows = false;
+    safeStorageState.available = true;
+    safeStorageState.failEncrypt = false;
+    safeStorageState.failDecrypt = false;
+  },
+};

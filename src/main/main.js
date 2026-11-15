@@ -1094,8 +1094,30 @@ ipcMain.handle('doubao-status', async () => {
   };
 });
 
-// 开始扫码登录。需要用户先确认风险提示，由渲染层负责把关。
+// ---------- 豆包风险确认(主进程统一把关) ----------
+//
+// 阶段3 审核指出的问题:doubao-login 完全没查 hasAcceptedDoubaoRisk,
+// 而 Renderer 真正调用的是 api.doubao.login() —— 也就是说
+// 实际 UI 路径正好走了那道没有校验的门,doubao-open-login-window
+// 上那道检查形同摆设。
+//
+// 修法:把校验收敛成一个内部函数 requireDoubaoRisk(),所有会
+// "开登录窗口 / 读 Cookie / 消耗额度"的通道都必须先过它。
+// 只信任主进程的 hasAcceptedDoubaoRisk,不信任 Renderer 传来的任何标志。
+//
+// 注意风险确认的语义边界:它只表示"用户确认读过风险提示",
+// 【不代表】豆包官方授权、【不代表】账号安全、【不代表】接口稳定。
+function requireDoubaoRisk() {
+  if (!hasAcceptedDoubaoRisk) {
+    return fail('请先阅读并确认风险提示', ERROR_CODES.E_STATE);
+  }
+  return null;
+}
+
+// 开始扫码登录。风险确认由主进程把关(不是只靠渲染层隐藏按钮)。
 ipcMain.handle('doubao-login', async () => {
+  const denied = requireDoubaoRisk();
+  if (denied) return denied;
   try {
     const r = await authManager.beginLogin();
     return r.ok ? ok({ state: r.state }) : fail(r.error || '登录启动失败', ERROR_CODES.E_STATE);
@@ -1123,11 +1145,11 @@ ipcMain.handle('doubao-logout', async () => {
   }
 });
 
-// 手动打开登录窗口(供"重新登录"用,与 doubao-login 等价但更明确)
+// 手动打开登录窗口(供"重新登录"用,与 doubao-login 等价但更明确)。
+// 与 doubao-login 共用同一个 requireDoubaoRisk(),不允许其中一个漏检。
 ipcMain.handle('doubao-open-login-window', async () => {
-  if (!hasAcceptedDoubaoRisk) {
-    return fail('请先阅读并确认风险提示', ERROR_CODES.E_STATE);
-  }
+  const denied = requireDoubaoRisk();
+  if (denied) return denied;
   try {
     const r = await authManager.beginLogin();
     return r.ok ? ok({ state: r.state }) : fail(r.error || '登录启动失败', ERROR_CODES.E_STATE);
@@ -1180,6 +1202,10 @@ ipcMain.handle('doubao-set-model', async (e, modelKey, effort) => {
 // 人工验证入口:明确提示会消耗额度,只在用户主动调用时执行。
 // 【不是自动流程】,也不做任何自动重试。
 ipcMain.handle('doubao-test-text', async (e, prompt) => {
+  // 会真实消耗豆包额度,必须与登录走同一道风险确认。
+  // 否则用户可以绕过风险告知直接打真实接口。
+  const denied = requireDoubaoRisk();
+  if (denied) return denied;
   let text;
   try { text = assertTheme(prompt); } catch (err) { return argFail(err); }
   if (!text) text = '你好，请只回复两个字：收到';
@@ -1199,6 +1225,9 @@ ipcMain.handle('doubao-test-text', async (e, prompt) => {
 
 // 人工验证生图:会消耗一次生图额度。明确不做自动重试。
 ipcMain.handle('doubao-test-image', async (e, prompt) => {
+  // 同 doubao-test-text:消耗生图额度,必须先过风险确认。
+  const denied = requireDoubaoRisk();
+  if (denied) return denied;
   let text;
   try { text = assertTheme(prompt); } catch (err) { return argFail(err); }
   if (!text) text = '一只白色的猫，坐姿，简洁背景，二次元风格';
