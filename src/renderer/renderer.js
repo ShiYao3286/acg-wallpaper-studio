@@ -200,18 +200,30 @@ function doubaoStateText(st) {
 }
 
 // 渲染按钮组。按状态决定能做什么,避免点了没反应。
-function doubaoButtons(st) {
+//
+// riskAccepted 参与判断的原因(阶段3 审核问题):
+//   - 消耗额度的按钮和"发起新登录"必须要求风险已确认;
+//   - 但"退出账号""取消登录"是止损操作,任何时候都必须给得出来,
+//     否则已登录用户重启后被锁在账号里出不去。
+function doubaoButtons(st, riskAccepted) {
   const btns = [];
   const S = st ? st.state : 'idle';
+  const risk = !!riskAccepted;
   if (S === 'authenticated') {
-    btns.push({ act: 'doubao-test-text', label: '测试文本(消耗额度)' });
-    btns.push({ act: 'doubao-test-image', label: '测试生图(消耗额度)' });
+    if (risk) {
+      btns.push({ act: 'doubao-test-text', label: '测试文本(消耗额度)' });
+      btns.push({ act: 'doubao-test-image', label: '测试生图(消耗额度)' });
+    }
+    // 退出账号:永远显示。它是止损路径,不能被风险确认状态挡住。
     btns.push({ act: 'doubao-logout', label: '退出账号', ghost: true });
-    btns.push({ act: 'doubao-relogin', label: '重新登录', ghost: true });
+    // 重新登录要开新窗口,属于"发起登录",需要风险确认
+    if (risk) btns.push({ act: 'doubao-relogin', label: '重新登录', ghost: true });
   } else if (S === 'awaiting_scan' || S === 'opening') {
+    // 取消登录:永远显示,同样是止损路径
     btns.push({ act: 'doubao-cancel-login', label: '取消登录', ghost: true });
   } else {
-    btns.push({ act: 'doubao-login', label: '扫码登录豆包' });
+    // 新登录入口:必须风险已确认
+    if (risk) btns.push({ act: 'doubao-login', label: '扫码登录豆包' });
   }
   return btns;
 }
@@ -232,10 +244,18 @@ async function refreshDoubao() {
       box.style.color = '#f87171';
     }
 
+    // 风险确认状态要在渲染按钮【之前】拿到:
+    // 按钮组本身就要靠它决定显示哪些按钮,顺序反了会先渲染出登录入口再隐藏,
+    // 视觉上有闪烁,逻辑上也会让"已登录未确认"这一态短暂出现错误按钮。
+    try {
+      const r = await api.doubao.riskAccepted();
+      doubaoRiskAccepted = !!(r && r.accepted);
+    } catch { doubaoRiskAccepted = false; }
+
     const act = $('doubao-actions');
     if (act) {
       act.textContent = '';
-      for (const b of doubaoButtons(st)) {
+      for (const b of doubaoButtons(st, doubaoRiskAccepted)) {
         const btn = document.createElement('button');
         btn.className = 'btn small' + (b.ghost ? ' ghost' : '');
         btn.textContent = b.label;
@@ -244,17 +264,30 @@ async function refreshDoubao() {
       }
     }
 
-    // 未接受风险提示时,禁止出现任何登录入口
-    try {
-      const r = await api.doubao.riskAccepted();
-      doubaoRiskAccepted = !!(r && r.accepted);
-    } catch { doubaoRiskAccepted = false; }
     const risk = $('doubao-risk');
     if (risk) {
       risk.style.display = (!doubaoRiskAccepted && st.state !== 'authenticated') ? 'block' : 'none';
     }
-    if (!doubaoRiskAccepted && act) act.style.display = 'none';
-    else if (act) act.style.display = '';
+
+    // 操作区可见性。
+    //
+    // 阶段3 审核发现的 bug:旧实现是
+    //   if (!doubaoRiskAccepted) act.style.display = 'none';
+    // 而 hasAcceptedDoubaoRisk 每次启动都重置为 false,于是
+    // "重启 → authManager.restore() 恢复成 authenticated → 风险提示隐藏
+    //   → 操作区也被隐藏" 三者叠加,已登录用户看不到【退出账号】按钮,
+    // 只能去删配置文件,等于把账号锁死在应用里。
+    //
+    // 正确语义:风险确认只该拦住"发起新登录"和"消耗额度",
+    // 不该拦住退出账号、取消登录这类【必要的管理/止损操作】。
+    // 已登录时即使风险未确认,也必须给得出退出账号。
+    //
+    // 这里只改显示判断,【不】把 doubaoRiskAccepted 自动置 true ——
+    // 那等于伪造用户确认,是更严重的错误。
+    if (act) {
+      const needsManageAction = (st.state === 'authenticated' || st.state === 'awaiting_scan' || st.state === 'opening');
+      act.style.display = (doubaoRiskAccepted || needsManageAction) ? '' : 'none';
+    }
 
     // 模型选择区:仅登录后显示;未登录时没有意义
     const modelBox = $('doubao-models');

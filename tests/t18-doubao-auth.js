@@ -392,6 +392,90 @@ function mkSafe(o) {
       stStr.slice(0, 120));
   }
 
+  // ==========================================================================
+  // I 组 —— 阶段3 审核修复:重启恢复后 Renderer 操作区可见性
+  //
+  // 做法:从【真实 src/renderer/renderer.js】里提取 doubaoButtons 函数源码,
+  // 在 vm 沙箱里执行。不是重写一份等价逻辑来"自证正确"——
+  // 如果生产代码被改回旧写法,这里提取到的就是旧代码,断言会真的失败。
+  //
+  // 覆盖的问题:hasAcceptedDoubaoRisk 每次启动重置为 false,
+  // 已登录时操作区被整体隐藏,用户看不到【退出账号】,账号被锁死。
+  // ==========================================================================
+  group('I 重启恢复后的操作区可见性');
+  {
+    const vm = require('node:vm');
+    const rSrc = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'renderer.js'), 'utf8');
+
+    function extractFn(name) {
+      const start = rSrc.indexOf('function ' + name + '(');
+      if (start < 0) return '';
+      let i = rSrc.indexOf('{', start), depth = 0;
+      for (; i < rSrc.length; i++) {
+        if (rSrc[i] === '{') depth++;
+        else if (rSrc[i] === '}') { depth--; if (depth === 0) return rSrc.slice(start, i + 1); }
+      }
+      return '';
+    }
+
+    const fnSrc = extractFn('doubaoButtons');
+    ok('I1', '能从真实 renderer.js 提取 doubaoButtons', fnSrc.length > 0, '长度 ' + fnSrc.length + 'B');
+
+    const ctx = {};
+    vm.createContext(ctx);
+    vm.runInContext(fnSrc + '; this.fn = doubaoButtons;', ctx);
+    const btns = ctx.fn;
+    const acts = (st, risk) => btns(st, risk).map(b => b.act);
+
+    // 场景 1:初次启动、未登录、未确认风险 → 要提示风险,不给登录入口
+    ok('I2', '初次启动未登录未确认风险:不出现登录入口',
+      acts({ state: 'idle' }, false).length === 0, JSON.stringify(acts({ state: 'idle' }, false)));
+
+    // 场景 2:已确认风险、未登录 → 出现登录入口
+    ok('I3', '已确认风险未登录:出现扫码登录入口',
+      acts({ state: 'idle' }, true).includes('doubao-login'));
+
+    // 场景 3:扫码中 → 出现取消登录
+    ok('I4', '扫码中:出现取消登录入口',
+      acts({ state: 'awaiting_scan' }, true).includes('doubao-cancel-login') &&
+      acts({ state: 'opening' }, true).includes('doubao-cancel-login'));
+
+    ok('I5', '扫码中即使未确认风险也要有取消登录',
+      acts({ state: 'awaiting_scan' }, false).includes('doubao-cancel-login'));
+
+    // 场景 4(本次修复的核心):已登录 + 风险未确认 → 仍必须有退出账号
+    ok('I6', '已登录且风险未确认:仍显示退出账号入口',
+      acts({ state: 'authenticated' }, false).includes('doubao-logout'),
+      JSON.stringify(acts({ state: 'authenticated' }, false)));
+
+    ok('I7', '已登录且风险未确认:不显示消耗额度的测试入口',
+      !acts({ state: 'authenticated' }, false).includes('doubao-test-text') &&
+      !acts({ state: 'authenticated' }, false).includes('doubao-test-image'));
+
+    ok('I8', '已登录且风险未确认:不显示重新登录入口(发起登录需确认)',
+      !acts({ state: 'authenticated' }, false).includes('doubao-relogin'));
+
+    // 场景 5:已登录 + 已确认 → 测试与退出都在
+    ok('I9', '已登录且已确认风险:测试与退出入口齐全', (() => {
+      const a = acts({ state: 'authenticated' }, true);
+      return a.includes('doubao-test-text') && a.includes('doubao-test-image') &&
+        a.includes('doubao-logout') && a.includes('doubao-relogin');
+    })(), JSON.stringify(acts({ state: 'authenticated' }, true)));
+
+    // 源码级:旧写法必须已被移除
+    ok('I10', 'renderer.js 不再无条件隐藏整个操作区',
+      !/if\s*\(\s*!doubaoRiskAccepted\s*&&\s*act\s*\)\s*act\.style\.display\s*=\s*'none'/.test(rSrc));
+    ok('I11', 'renderer.js 未把风险确认状态自动置 true(不伪造用户确认)',
+      !/doubaoRiskAccepted\s*=\s*true\s*;[^\n]*\/\//.test(rSrc) || !/risk\.style/.test(rSrc) === false);
+
+    // 操作区可见性判断:已登录时必须可见
+    ok('I12', '操作区可见性包含"已登录必须可见"的判断', (() => {
+      const m = rSrc.match(/const needsManageAction\s*=\s*\(([^)]+)\)/);
+      if (!m) return false;
+      return m[1].includes("'authenticated'") && m[1].includes("'awaiting_scan'");
+    })(), '命中 needsManageAction 判断');
+  }
+
   group('D Provider 协议兼容');
   {
     const lol = require(path.join(ROOT, 'src', 'main', 'plugins', 'builtin', 'lolicon-provider.js'));
