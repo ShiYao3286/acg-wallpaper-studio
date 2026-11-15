@@ -117,8 +117,25 @@ async function fetchImage(ctx, url, hint) {
   try { u = new URL(String(url || '')); } catch { throw new Error('图片地址无效'); }
   if (u.protocol !== 'https:') throw new Error('图片地址必须是 https');
 
-  const res = await ctx.netFetch(url, { signal: AbortSignal.timeout(120000) });
-  if (!res.ok) throw new Error('下载图片失败 HTTP ' + res.status);
+  // 图片地址是签名 CDN 链接,网络抖动比主接口常见得多。
+  // 这里把"网络/超时"与"内容不对"分开报,用户才知道该重试还是该报缺陷。
+  let res;
+  try {
+    res = await ctx.netFetch(url, { signal: AbortSignal.timeout(120000) });
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    if (e && (e.name === 'AbortError' || /abort|timeout/i.test(msg))) {
+      throw new Error('下载生成图片超时,请重试');
+    }
+    throw new Error('下载生成图片失败(网络异常,请检查网络或代理后重试): ' + msg);
+  }
+  if (!res.ok) {
+    // 403/404 多为签名过期(生成后隔太久才下载),明确告知
+    if (res.status === 403 || res.status === 404) {
+      throw new Error('生成图片的下载链接已失效(HTTP ' + res.status + '),请重新生成');
+    }
+    throw new Error('下载图片失败 HTTP ' + res.status);
+  }
 
   // 先看 Content-Length,超限直接拒,避免把超大响应读进内存
   const cl = Number(res.headers && res.headers.get ? res.headers.get('content-length') : 0);
@@ -166,7 +183,10 @@ async function generate(ctx) {
       signal: ctx.signal,
     });
   } catch (e) {
-    throw new Error(humanize(e));
+    // 把 kind 挂到错误上,IPC 层据此区分"网络问题"与"账号问题"
+    const err = new Error(humanize(e));
+    err.kind = (e && e.kind) || 'UNKNOWN_ERROR';
+    throw err;
   }
 
   if (!r.creations || !r.creations.length) {

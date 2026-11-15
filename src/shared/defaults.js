@@ -22,6 +22,10 @@ const DEFAULT_CONFIG = {
     size: '1536x1024',
     // 随机生成模式: any=完全随机 portrait=锁定人物 scenery=锁定风景 custom=自定义提示词
     randomMode: 'any',
+    // 阶段3:AI 生图走哪个引擎。
+    //   'service' OpenAI 兼容服务(默认,保持既有行为)
+    //   'doubao'  豆包账号 Seedream(需先登录)
+    imageEngine: 'service',
   },
   // 提示词预设槽
   promptPresets: [

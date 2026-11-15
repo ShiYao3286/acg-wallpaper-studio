@@ -379,7 +379,30 @@ function classifyError(e) {
 
 // 阶段2起实现迁移到 plugins/builtin/openai-image-provider.js。
 // 注意返回契约:Provider 返回 { buffer },本函数解包成 Buffer 保持调用方不变。
+//
+// 阶段3:支持把 AI 生图路由到豆包账号。
+// 路由判据是 cfg.ai.imageEngine:
+//   'service' (默认) -> 走 OpenAI 兼容服务(既有行为,不变)
+//   'doubao'         -> 走豆包 Seedream(需要已登录)
+// 选择在 UI 的「模型」下拉里体现,值与 engine 一一对应。
 async function fetchAI(cfg, serviceId, finalPrompt) {
+  const engine = (cfg && cfg.ai && cfg.ai.imageEngine) || 'service';
+
+  if (engine === 'doubao') {
+    const provider = providerRegistry.get('doubao-image');
+    if (!provider) throw new Error('豆包 Provider 不可用');
+    const dcfg = cfg.doubao || {};
+    const res = await provider.generate({
+      config: cfg,
+      netFetch,
+      doubao: { converse: (o) => doubaoTransport.converse(o) },
+      prompt: finalPrompt,
+      modelKey: dcfg.textModel,
+      timeoutMs: 180000,
+    });
+    return res.buffer;
+  }
+
   const provider = providerRegistry.get('openai-image');
   if (!provider) throw new Error('内置 Provider 不可用: openai-image');
   const res = await provider.generate({

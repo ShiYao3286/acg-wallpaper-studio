@@ -61,10 +61,17 @@ const CLICK_ACTIONS = {
 // 模型下拉变更即保存(不需要额外按钮)
 document.addEventListener('change', (ev) => {
   const t = ev.target;
-  if (t && (t.id === 'doubao-model-select' || t.id === 'doubao-effort-select')) {
+  if (!t) return;
+  if (t.id === 'doubao-model-select' || t.id === 'doubao-effort-select') {
     saveDoubaoModel();
+    return;
   }
-});
+  // AI 页模型下拉改为自定义处理(需要区分 doubao / svc: 两种值)
+  if (t.id === 'ai-model') {
+    ev.stopPropagation();
+    onAiModelChange();
+  }
+}, true);
 
 // change 类:key 来自 data-key,值来自元素自身
 const CHANGE_SETTERS = {
@@ -506,13 +513,26 @@ async function changeNow() {
   } finally { btn.disabled = false; }
 }
 async function aiNow() {
-  // 无画图服务时引导到 API 服务页
-  const services = await api.listServices();
-  const hasImage = services.some(s => s.kind === 'image');
-  if (!hasImage) {
-    toast('请先到「API 服务」页添加画图 API(需支持 /v1/images/generations)', 5000);
-    document.querySelector('.nav-item[data-page="services"]').click();
-    return;
+  const cfg = await api.getConfig();
+  const engine = (cfg.ai && cfg.ai.imageEngine) || 'service';
+
+  if (engine === 'doubao') {
+    // 豆包引擎:先确认已登录,否则给明确指引而不是让用户等到超时
+    const ds = await api.doubao.status();
+    if (!ds || ds.state !== 'authenticated') {
+      toast('豆包未登录:请到「API 服务」页的豆包卡片扫码登录', 5000);
+      document.querySelector('.nav-item[data-page="services"]').click();
+      return;
+    }
+  } else {
+    // 服务引擎:无画图服务时引导到 API 服务页
+    const services = await api.listServices();
+    const hasImage = services.some(s => s.kind === 'image');
+    if (!hasImage) {
+      toast('请先到「API 服务」页添加画图 API(需支持 /v1/images/generations)', 5000);
+      document.querySelector('.nav-item[data-page="services"]').click();
+      return;
+    }
   }
   const btn = $('btn-ai'); btn.disabled = true;
   toast('AI 正在生成,约 20~60 秒…', 60000);
@@ -878,15 +898,94 @@ async function testEditing() {
   $('svc-editor-result').textContent = r.ok ? ('✓ ' + r.detail) : ('✗ ' + r.error);
 }
 
+
+// AI 页「模型」下拉:把"用哪个引擎生图"和"具体模型"合成一个选择。
+//
+// 值域约定:
+//   'doubao'            -> 走豆包账号 Seedream(cfg.ai.imageEngine = 'doubao')
+//   'svc:<modelName>'   -> 走 OpenAI 兼容服务,model 写入 cfg.ai.model
+// 这样用户在一个下拉里就能选"用豆包还是用某个 API 服务",不用去两个页面来回切。
+async function refreshImageEngineOptions(st) {
+  const sel = $('ai-model');
+  if (!sel) return;
+  try {
+    const cfg = await api.getConfig();
+    const engine = (cfg.ai && cfg.ai.imageEngine) || 'service';
+    const curModel = (cfg.ai && cfg.ai.model) || '';
+    // 模型列表来自远端拉取,可能为空(服务不可达 / 尚未拉取)。
+    // 【不能用空列表就只剩豆包一个选项】—— 那样用户会以为服务没了。
+    // 兜底:把当前激活服务配置的模型名也放进去,保证至少能看到自己在用的模型。
+    const fetched = (st && Array.isArray(st.imageModels)) ? st.imageModels : [];
+    const services = await api.listServices();
+    const activeSvc = services.find(s => s.id === cfg.activeImageService && s.kind === 'image');
+    const models = fetched.slice();
+    if (curModel && !models.includes(curModel)) models.unshift(curModel);
+    if (activeSvc && activeSvc.model && !models.includes(activeSvc.model)) models.push(activeSvc.model);
+    const prev = sel.value;
+    sel.textContent = '';
+
+    // 豆包选项:仅在已登录时可用
+    let doubaoReady = false;
+    try {
+      const ds = await api.doubao.status();
+      doubaoReady = ds && ds.state === 'authenticated';
+    } catch { doubaoReady = false; }
+
+    const optD = document.createElement('option');
+    optD.value = 'doubao';
+    optD.textContent = '豆包 Seedream' + (doubaoReady ? '' : '(未登录)');
+    if (!doubaoReady) { optD.disabled = true; optD.style.color = '#6b7280'; }
+    sel.appendChild(optD);
+
+    // 服务模型选项
+    for (const m of models) {
+      const o = document.createElement('option');
+      o.value = 'svc:' + m;
+      o.textContent = m;
+      sel.appendChild(o);
+    }
+
+    // 回填当前值。优先级:配置里的模型 > 上次选中的值 > 列表第一项。
+    // 不能无条件用 models[0],否则会把用户已选好的模型悄悄改掉。
+    if (engine === 'doubao' && doubaoReady) {
+      sel.value = 'doubao';
+    } else if (curModel && models.includes(curModel)) {
+      sel.value = 'svc:' + curModel;
+    } else if (prev && [...sel.options].some(o => o.value === prev && !o.disabled)) {
+      sel.value = prev;
+    } else if (models.length) {
+      sel.value = 'svc:' + models[0];
+    } else if (doubaoReady) {
+      sel.value = 'doubao';
+    }
+  } catch (e) {
+    // 读取失败时保持原样,不把下拉清空
+  }
+}
+
+// 下拉变更:切换引擎或模型
+async function onAiModelChange() {
+  const sel = $('ai-model');
+  if (!sel) return;
+  const v = String(sel.value || '');
+  if (v === 'doubao') {
+    await api.saveConfig('ai.imageEngine', 'doubao');
+    toast('已切换到豆包 Seedream 生图', 3000);
+    return;
+  }
+  if (v.startsWith('svc:')) {
+    const model = v.slice(4);
+    await api.saveConfig('ai.imageEngine', 'service');
+    await api.saveConfig('ai.model', model);
+    toast('已切换到服务模型: ' + model, 3000);
+  }
+}
+
 // ---------- 状态栏 ----------
 async function refreshStatus() {
   const st = await api.getStatus();
-  // AI 页模型下拉:跟随当前画图服务的模型列表
-  if (Array.isArray(st.imageModels) && st.imageModels.length) {
-    const cur = $('ai-model').value;
-    fillModelOptions('ai-model', st.imageModels, false);
-    if (st.imageModels.includes(cur)) $('ai-model').value = cur;
-  }
+  // AI 页模型下拉:跟随当前画图服务的模型列表 + 豆包引擎(阶段3)
+  await refreshImageEngineOptions(st);
   // 模型列表拉取失败不再静默:明确告诉用户失败了、原因是什么,而不是留一个空下拉框让人猜
   const modelsErrTip = st.imageModelsError ? ('模型列表获取失败: ' + st.imageModelsError) : '';
   if (st.currentPath) {

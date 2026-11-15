@@ -229,8 +229,12 @@ const throws = (fn) => { try { fn(); return null; } catch (e) { return e; } };
     ok('D4', 'fetchLolicon 已委托 Provider(不再内联拼 URL)',
       /async function fetchLolicon[\s\S]{0,300}providerRegistry\.get\('lolicon'\)/.test(mainSrc) &&
       !/api\.lolicon\.app/.test(mainSrc));
-    ok('D5', 'fetchAI 已委托 Provider',
-      /async function fetchAI[\s\S]{0,300}providerRegistry\.get\('openai-image'\)/.test(mainSrc));
+    // 阶段3 起 fetchAI 有两条路由(豆包 / OpenAI 兼容服务),不能再只匹配单一写法。
+    // 真正要保障的是"它从 registry 取 Provider,而不是内联实现"。
+    ok('D5', 'fetchAI 通过 registry 取 Provider(支持多引擎路由)',
+      /async function fetchAI[\s\S]{0,1600}providerRegistry\.get\('openai-image'\)/.test(mainSrc)
+      && /async function fetchAI[\s\S]{0,1600}providerRegistry\.get\('doubao-image'\)/.test(mainSrc),
+      '阶段3:AI 生图可在"OpenAI 兼容服务"与"豆包 Seedream"之间路由');
     ok('D6', 'ai-assist-prompt 已委托 Provider',
       /providerRegistry\.get\('openai-text'\)/.test(mainSrc));
     const genHits = (mainSrc.match(/images\/generations/g) || []).length;

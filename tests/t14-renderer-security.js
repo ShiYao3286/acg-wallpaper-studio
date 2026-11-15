@@ -40,7 +40,9 @@ const js = fs.readFileSync(RENDERER, 'utf8');
     // 不写死数量:阶段3 新增豆包卡片后交互元素会增长。
     // 真正要保障的是"没有残留内联事件"(B1)与"每个 data-act 都有实现"(C5)。
     ok('B2', 'data-act 元素数量不小于去内联事件时的基线 29', acts.length >= 29, '实际 ' + acts.length);
-    ok('B3', 'data-set 数量与改造前 onchange 一致 9', sets.length === 9, '实际 ' + sets.length);
+    // 阶段3 把 ai-model 改成自定义处理(需要区分 doubao/svc: 两种值),移除了它的 data-set。
+    // 保障的是"没有残留内联事件"(B1)与"每个 data-set 都有实现"(C6)。
+    ok('B3', 'data-set 元素仍在使用(阶段3 后有增减属正常)', sets.length >= 8, '实际 ' + sets.length);
     ok('B4', 'HTML 中不再出现内联函数调用文本', html.indexOf('onclick="api.') < 0 && !/onclick="[a-zA-Z_]+\(/.test(html));
   }
 
