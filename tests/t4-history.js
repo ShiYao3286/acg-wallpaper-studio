@@ -2,7 +2,7 @@
 // —— 全部【直接测试生产代码】(真实 main.js,IPC 通道驱动,真实文件系统)
 const path = require('node:path');
 const fs = require('node:fs');
-const { group, ok, mkTmp, cleanupTmp, fakeJpeg, sleep, listFiles, summarize } = require('./common');
+const { group, ok, skip, mkTmp, cleanupTmp, fakeJpeg, sleep, listFiles, summarize } = require('./common');
 const { loadMain, waitBoot, setWallpaperBehavior, closeAllWatchers } = require('./harness');
 
 const ESC = '\uFEFF';
@@ -172,9 +172,20 @@ const readJsonl = (p) => fs.readFileSync(p, 'utf8').trim().split('\n').filter(Bo
     const B = fakeJpeg(16000, 'Q-B');
     fs.writeFileSync(cur, A);
     fs.writeFileSync(histFile, JSON.stringify({ file: 'current.jpg', time: 'q0', bytes: A.length }) + '\n', 'utf8');
-    // 连续两次 use-history,间隔极短,极可能落在同一秒(触发同名归档)
     fs.writeFileSync(path.join(env.wallDir, 'hist_src1.jpg'), B);
     fs.writeFileSync(path.join(env.wallDir, 'hist_src2.jpg'), fakeJpeg(17000, 'Q-C'));
+    // 重名防护只有在"同一秒内两次归档"时才会触发。
+    // 旧写法直接连续调用,若两次调用跨了秒边界(实测出现过 …183552 / …183553),
+    // 文件名天然不同,Q3 就不成立 —— 那不是代码没去重,而是这个实验没构造出重名场景。
+    // 因此先对齐到当前秒的起点再发起两次归档(与 t9 BD 组同一手法)。
+    const waitForFreshSecond = async () => {
+      const start = Date.now();
+      while (Date.now() % 1000 > 120) {
+        if (Date.now() - start > 2000) break;   // 兜底,避免死等
+        await sleep(10);
+      }
+    };
+    await waitForFreshSecond();
     const r1 = await env.call('use-history', 'hist_src1.jpg');
     const r2 = await env.call('use-history', 'hist_src2.jpg');
     ok('Q1', '两次连续 use-history 均成功', r1 && r1.ok && r2 && r2.ok, JSON.stringify([r1, r2]));
@@ -182,12 +193,20 @@ const readJsonl = (p) => fs.readFileSync(p, 'utf8').trim().split('\n').filter(Bo
     // 找两次归档产生的文件(排除两个来源文件 hist_src*)
     const produced = fs.readdirSync(env.wallDir).filter(f => /^hist_\d{8}_\d{6}(_\d+)?\.jpg$/.test(f));
     ok('Q2', '两次归档产生 2 个归档文件(未互相覆盖)', produced.length === 2, '归档: [' + produced.join(', ') + ']');
-    ok('Q3', '同秒归档时第二个带 _1 去重后缀', (() => {
-      const bases = produced.map(f => f.replace(/_\d+\.jpg$/, '').replace(/\.jpg$/, ''));
+    // Q3 只在"确实构造出同秒"时才断言 _1 后缀;若仍跨秒,如实标记跳过而不是白送通过。
+    {
+      // 只剥离形如 hist_20260101_120000_1.jpg 末尾的去重后缀 "_1",
+      // 不能用 /_\d+\.jpg$/ 一刀切 —— 那会把时间戳里的数字也吃掉,导致不同秒的文件被误判为同秒。
+      const bases = produced.map(f => f.replace(/^hist_(\d{8})_(\d{6})(?:_\d+)?\.jpg$/, 'hist_$1_$2'));
+      const sameSecond = new Set(bases).size === 1 && produced.length === 2;
       const hasSuffix = produced.some(f => /_1\.jpg$/.test(f));
-      const sameBase = new Set(bases).size === 1;
-      return hasSuffix || !sameBase; // 同秒时必须出现 _1;跨秒时自然不重名,同样不算覆盖
-    })(), '归档文件: [' + produced.join(', ') + ']');
+      if (sameSecond) {
+        ok('Q3', '同秒归档时第二个带 _1 去重后缀', hasSuffix, '归档: [' + produced.join(', ') + ']');
+      } else {
+        skip('Q3', '同秒归档时第二个带 _1 去重后缀',
+          '时序未对齐(两次归档跨秒),本次未能构造重名场景;归档: [' + produced.join(', ') + ']');
+      }
+    }
     ok('Q4', '第一次归档的 A 图内容仍可完整找回(未被覆盖)',
       produced.some(f => fs.readFileSync(path.join(env.wallDir, f)).equals(A)),
       '归档大小: ' + produced.map(f => f + '=' + fs.statSync(path.join(env.wallDir, f)).size).join(', '));

@@ -35,7 +35,9 @@ const isArgFail = (r) => r && r.ok === false && r.code === 'E_INVALID_ARG' && ty
   const call = envCall(envMain);
   {
     const chans = [...envMain.state.ipcHandlers.keys()].sort();
-    ok('D1', '真实 main.js 可加载且注册 30 个 IPC 通道', chans.length === 30, '实际 ' + chans.length + ' 个: ' + chans.join(','));
+    // 不写死数量:通道会随阶段增长(阶段2 新增 list-plugins / set-plugin-enabled)。
+  // 真正要保障的是"注册了通道"以及"与 preload 双向齐平"(见 D3),数量本身不是契约。
+  ok('D1', '真实 main.js 可加载且注册了 IPC 通道', chans.length > 0, '实际 ' + chans.length + ' 个: ' + chans.join(','));
     const expect = ['get-config', 'save-config', 'change-wallpaper', 'list-history', 'use-history', 'get-status',
       'get-autorun', 'set-autorun', 'open-wallpaper-dir', 'add-tag', 'remove-tag', 'disable-old-task', 'list-services',
       'save-service', 'delete-service', 'set-active-service', 'test-service', 'fetch-models', 'ai-assist-prompt',
@@ -47,7 +49,7 @@ const isArgFail = (r) => r && r.ok === false && r.code === 'E_INVALID_ARG' && ty
     const preloadChans = [...preloadSrc.matchAll(/ipcRenderer\.invoke\('([^']+)'/g)].map(m => m[1]);
     const preloadMissing = preloadChans.filter(c => !chans.includes(c));
     ok('D3', 'preload 每个 invoke 通道都有主进程 handler(双向齐平)',
-      preloadMissing.length === 0 && preloadChans.length === 30,
+      preloadMissing.length === 0 && preloadChans.length > 0,
       'preload ' + preloadChans.length + ' 个, 缺失 ' + preloadMissing.length + ' 个');
     const extra = chans.filter(c => !preloadChans.includes(c));
     ok('D4', '主进程无 preload 之外的孤儿通道', extra.length === 0, extra.length ? '孤儿: ' + extra.join(',') : '无孤儿');

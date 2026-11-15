@@ -39,6 +39,9 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('ui-refresh', handler);
   },
   queryOldTask: () => ipcRenderer.invoke('query-old-task'),
+  // 插件管理(阶段2):listPlugins 返回元数据,不含实现对象
+  listPlugins: () => ipcRenderer.invoke('list-plugins'),
+  setPluginEnabled: (id, on) => ipcRenderer.invoke('set-plugin-enabled', id, on),
   win: {
     minimize: () => ipcRenderer.invoke('win-minimize'),
     close: () => ipcRenderer.invoke('win-close'),

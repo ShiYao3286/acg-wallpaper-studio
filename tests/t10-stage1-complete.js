@@ -91,10 +91,13 @@ function ok(id, title, cond, evidence) {
   // ============ B. 30 通道分类完整性 ============
   console.log('\n---- B. 30 通道分类 ----');
   const allChannels = [...loaded.state.ipcHandlers.keys()].sort();
-  ok('B1', 'IPC 通道总数为 30', allChannels.length === 30, '实际 ' + allChannels.length);
+  // 不写死数量:阶段2 起通道会增加。这里只校验"通道存在且与 preload 齐平"(B3),
+  // 数量变化本身不是缺陷 —— 写死数字会让每次合理新增都变成假失败。
+  ok('B1', 'IPC 通道已注册且数量大于 0', allChannels.length > 0, '实际 ' + allChannels.length + ' 个');
   const preloadSrc = fs.readFileSync(path.join(REPO, 'src/main/preload.js'), 'utf8');
   const preChannels = [...preloadSrc.matchAll(/ipcRenderer\.invoke\('([^']+)'/g)].map(m => m[1]).sort();
-  ok('B2', 'preload 暴露通道数为 30', preChannels.length === 30, '实际 ' + preChannels.length);
+  ok('B2', 'preload 暴露通道数与主进程一致', preChannels.length === allChannels.length,
+    'preload ' + preChannels.length + ' / main ' + allChannels.length);
   ok('B3', 'main 与 preload 通道完全一致', JSON.stringify(allChannels) === JSON.stringify(preChannels),
     'diff: ' + allChannels.filter(c => !preChannels.includes(c)).join(',') + ' | ' + preChannels.filter(c => !allChannels.includes(c)).join(','));
 

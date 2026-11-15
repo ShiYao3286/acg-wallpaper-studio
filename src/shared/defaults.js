@@ -37,6 +37,9 @@ const DEFAULT_CONFIG = {
   // 出网代理(访问 Lolicon / AI API 用):enabled=false 直连
   proxy: { enabled: false, url: '' },   // 例: http://127.0.0.1:7897(Clash Verge)
   migrate: { oldTaskDisabled: false },
+  // 外部插件(阶段2)。enabled 是用户显式启用的插件 id 列表。
+  // 默认空:外部插件不会自动执行,必须用户手动开启。
+  plugins: { enabled: [] },
 };
 
 // 本地风格词池:文本模型未配置时的提示词增强兜底

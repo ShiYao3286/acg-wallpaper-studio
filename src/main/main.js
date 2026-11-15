@@ -18,6 +18,7 @@ const providerRegistry = require('./plugins/provider-registry');
 const loliconProvider = require('./plugins/builtin/lolicon-provider');
 const openaiImageProvider = require('./plugins/builtin/openai-image-provider');
 const openaiTextProvider = require('./plugins/builtin/openai-text-provider');
+const pluginLoader = require('./plugins/plugin-loader');
 
 let win = null;
 let tray = null;
@@ -90,6 +91,48 @@ try {
   // 注册失败属于开发期错误(内置 Provider 不该校验不过),
   // 这里不吞掉:直接抛出,让启动失败并暴露问题,避免带病运行。
   throw new Error('内置 Provider 注册失败: ' + ((err && err.message) || err));
+}
+
+// ---------- 外部插件发现(阶段2 第4步) ----------
+// 只做"发现 + 登记为禁用态",不执行任何插件代码。
+// 外部插件必须由用户显式启用才会 require —— 避免把来路不明的代码在启动时自动跑起来。
+const pluginsRoot = () => path.join(app.getPath('userData'), 'plugins');
+let pluginScan = { found: [], skipped: [] };
+function scanExternalPlugins() {
+  const r = pluginLoader.discover(pluginsRoot());
+  pluginScan = r;
+  return r;
+}
+// 插件启用状态存在配置里(plugin.enabled 数组),而不是写回插件目录。
+// 这样插件目录保持只读语义,用户手动拷贝插件不会因为权限问题失败。
+function isPluginEnabled(cfg, id) {
+  const list = (cfg && cfg.plugins && Array.isArray(cfg.plugins.enabled)) ? cfg.plugins.enabled : [];
+  return list.indexOf(id) >= 0;
+}
+
+// 启动时恢复用户此前已启用的外部插件。
+// 单个插件失败只记录在 pluginScan.skipped 中,不抛错、不阻塞启动。
+async function restoreEnabledPlugins() {
+  const cfg = await loadConfig();
+  const enabledIds = (cfg.plugins && Array.isArray(cfg.plugins.enabled)) ? cfg.plugins.enabled : [];
+  if (!enabledIds.length) return { restored: [], failed: [] };
+  const scan = scanExternalPlugins();
+  const restored = [];
+  const failed = [];
+  for (const id of enabledIds) {
+    const item = scan.found.find(x => x.id === id);
+    if (!item) { failed.push({ id, reason: '插件目录已不存在或 manifest 失效' }); continue; }
+    const loaded = pluginLoader.loadOne(item);
+    if (!loaded.ok) { failed.push({ id, reason: loaded.reason }); continue; }
+    try {
+      providerRegistry.register(loaded.provider);
+      providerRegistry.setEnabled(id, true);
+      restored.push(id);
+    } catch (e) {
+      failed.push({ id, reason: (e && e.message) || String(e) });
+    }
+  }
+  return { restored, failed };
 }
 
 // ---------- 配置存取 ----------
@@ -1098,6 +1141,81 @@ ipcMain.handle('favorite-current', async () => {
     return { ok: true, file: dest };
   } catch (err) { return { ok: false, error: err.message }; }
 });
+// ---------- 插件管理(阶段2 第4步) ----------
+// 返回:内置 Provider(始终启用) + 外部插件(含未启用/加载失败原因)。
+// 注意只返回元数据,绝不把 Provider 实现对象或函数传给渲染层。
+ipcMain.handle('list-plugins', async () => {
+  const cfg = await loadConfig();
+  const scan = scanExternalPlugins();
+  const builtin = providerRegistry.list().map(p => ({ ...p, builtin: true, enabled: p.enabled !== false, status: 'ok' }));
+  const external = scan.found.map(item => {
+    const enabled = isPluginEnabled(cfg, item.id);
+    return {
+      id: item.id,
+      name: (typeof item.manifest.name === 'string' && item.manifest.name.trim()) ? item.manifest.name : item.id,
+      version: typeof item.manifest.version === 'string' ? item.manifest.version : '0.0.0',
+      kind: typeof item.manifest.kind === 'string' ? item.manifest.kind : '(未声明)',
+      capabilities: Array.isArray(item.manifest.capabilities) ? item.manifest.capabilities : [],
+      builtin: false,
+      enabled,
+      status: enabled ? 'enabled' : 'disabled',
+    };
+  });
+  return {
+    builtin,
+    external,
+    // 扫描阶段被跳过的目录一并返回,让用户知道"我放了插件但没被识别"的原因
+    skipped: scan.skipped.map(s => ({ dir: path.basename(s.dir), reason: s.reason })),
+    pluginsDir: pluginsRoot(),
+  };
+});
+
+// 启用/停用外部插件。启用时会真实 require 其代码并注册进 registry,
+// 因此这一步是"用户显式授权执行第三方代码"的唯一入口。
+ipcMain.handle('set-plugin-enabled', async (e, rawId, rawOn) => {
+  let id, on;
+  try {
+    id = assertId(rawId, '插件 id');
+    on = assertBool(rawOn);
+  } catch (err) { return argFail(err); }
+
+  const cfg = await loadConfig();
+  const list = (cfg.plugins && Array.isArray(cfg.plugins.enabled)) ? cfg.plugins.enabled.slice() : [];
+  const idx = list.indexOf(id);
+
+  if (!on) {
+    // 停用:移出启用列表并禁用注册表条目。不 require,不需要插件存在。
+    if (idx >= 0) list.splice(idx, 1);
+    providerRegistry.setEnabled(id, false);
+    try { await saveConfig({ plugins: { enabled: list } }); }
+    catch (err) { return failFrom(err, ERROR_CODES.E_IO, { configAborted: true }); }
+    return { ok: true, id, enabled: false };
+  }
+
+  // 启用:必须能在磁盘上找到该插件
+  const scan = scanExternalPlugins();
+  const item = scan.found.find(x => x.id === id);
+  if (!item) {
+    const why = scan.skipped.find(s => path.basename(s.dir) === id);
+    return fail('未找到插件: ' + id + (why ? '(' + why.reason + ')' : ''), ERROR_CODES.E_NOT_FOUND);
+  }
+  const loaded = pluginLoader.loadOne(item);
+  if (!loaded.ok) return fail('插件加载失败: ' + loaded.reason, ERROR_CODES.E_STATE);
+
+  try { providerRegistry.register(loaded.provider); }
+  catch (err) { return failFrom(err, ERROR_CODES.E_INVALID_ARG); }
+  providerRegistry.setEnabled(id, true);
+
+  if (idx < 0) list.push(id);
+  try { await saveConfig({ plugins: { enabled: list } }); }
+  catch (err) {
+    // 配置写失败时回退注册表状态,避免"内存里启用、重启后消失"的不一致
+    providerRegistry.setEnabled(id, false);
+    return failFrom(err, ERROR_CODES.E_IO, { configAborted: true });
+  }
+  return { ok: true, id, enabled: true };
+});
+
 ipcMain.handle('list-favorites', async () => {
   try {
     const favDir = path.join(wallDir(), 'favorites');
@@ -1204,6 +1322,9 @@ if (!app.requestSingleInstanceLock()) {
     if (healed && healed.recovered) {
       buildTrayMenu(); // 刷新托盘 tooltip
     }
+    // 恢复上次已启用的外部插件。这是用户此前显式授权过的代码,重启后需要继续生效;
+    // 但仍走一遍完整校验,插件被改动/损坏时按"跳过并记录"处理,不影响主程序启动。
+    try { await restoreEnabledPlugins(); } catch {}
     startWatcher();
   });
 }
