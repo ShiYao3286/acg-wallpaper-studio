@@ -90,6 +90,93 @@ function mkProvider(id, builtin) {
       const cases = [() => reg.register(mkProvider('lolicon', false))];
       return cases.every(fn => { try { fn(); return false; } catch (e) { return protocol.isProtocolError(e); } });
     })());
+    // ---------- G13: registerAll 与已有 registry 冲突,必须整体不生效 ----------
+    {
+      const reg2 = require(path.join(PLUGINS, 'provider-registry.js'));
+      reg2.reset();
+      reg2.register(mkProvider('existing-bi', true));
+      const implBefore = reg2.get('existing-bi');
+      const metaBefore = reg2.getMeta('existing-bi');
+      const sizeBefore = reg2.size();
+      reg2.setEnabled('existing-bi', false);
+      const enabledBefore = reg2.isEnabled('existing-bi');
+      const threw = (() => {
+        try {
+          reg2.registerAll([mkProvider('new-one', true), mkProvider('existing-bi', false)]);
+          return null;
+        } catch (e) { return e; }
+      })();
+      ok('G13', 'registerAll 与已有 registry 冲突时整体失败', !!threw && protocol.isProtocolError(threw),
+        threw ? threw.message : '未抛错');
+      ok('G13b', '失败后前一个新 Provider 未被部分注册', !reg2.has('new-one') && reg2.size() === sizeBefore,
+        'size=' + reg2.size() + ' (期望 ' + sizeBefore + ')');
+      // 注意:get() 在 disabled 状态下返回 null,因此这里不能用 get() 比引用。
+      // 先恢复 enabled 拿到实现引用做比对,再置回 disabled 保持后续状态断言的前提。
+      reg2.setEnabled('existing-bi', true);
+      const implAfter = reg2.get('existing-bi');
+      reg2.setEnabled('existing-bi', false);
+      ok('G13c', '失败后原有 Provider 实现引用不变', implAfter === implBefore,
+        'disabled 时 get() 返回 null,故先临时启用再比对');
+      ok('G13d', '失败后原有 Provider 元数据不变', JSON.stringify(reg2.getMeta('existing-bi')) === JSON.stringify(metaBefore));
+      ok('G13e', '失败后 enabled/disabled 状态不变', reg2.isEnabled('existing-bi') === enabledBefore,
+        '期望 ' + enabledBefore + ' 实际 ' + reg2.isEnabled('existing-bi'));
+    }
+    // ---------- G14: 内置 Provider 严格幂等(不替换实现、不动状态) ----------
+    {
+      const reg3 = require(path.join(PLUGINS, 'provider-registry.js'));
+      reg3.reset();
+      const first = mkProvider('idem-bi', true);
+      reg3.register(first);
+      const implA = reg3.get('idem-bi');
+      ok('G14a', '内置 Provider 首次注册成功', !!implA && reg3.size() === 1);
+      // 第二次用"实现不同"的同 id 内置对象注册
+      const second = mkProvider('idem-bi', true);
+      second.complete = async () => ({ replaced: true });
+      reg3.register(second);
+      ok('G14b', '内置同 id 再次注册不替换现有实现(引用不变)', reg3.get('idem-bi') === implA,
+        '严格幂等:原实现引用必须保持');
+      // 再验证 disabled 状态不被改动
+      reg3.setEnabled('idem-bi', false);
+      reg3.register(mkProvider('idem-bi', true));
+      ok('G14c', '内置同 id 再次注册不改变 disabled 状态', reg3.isEnabled('idem-bi') === false,
+        '幂等不应把已停用的条目悄悄启用');
+    }
+    // ---------- G15: 外部插件自报 builtin:true 不能获得内置身份 ----------
+    // 走真实加载器路径(discover + loadOne),不是直接调 describeProvider
+    {
+      const loader2 = require(path.join(PLUGINS, 'plugin-loader.js'));
+      const os2 = require('node:os');
+      const base = fs.mkdtempSync(path.join(os2.tmpdir(), 'acg-g15-'));
+      try {
+        const dir = path.join(base, 'faker');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
+          id: 'faker', name: 'faker', version: '1.0.0',
+          kind: 'text', capabilities: ['complete'],
+        }, null, 2), 'utf8');
+        fs.writeFileSync(path.join(dir, 'index.js'),
+          'module.exports = { builtin: true, async complete(){ return { ok:true, prompt:"x", local:false }; } };', 'utf8');
+        const scan = loader2.discover(base);
+        ok('G15a', '自报 builtin 的插件可被发现', scan.found.length === 1, 'found=' + scan.found.length);
+        const loaded = loader2.loadOne(scan.found[0]);
+        ok('G15b', '加载成功', loaded.ok === true, loaded.ok ? '' : loaded.reason);
+        ok('G15c', '加载后 builtin 被强制为 false(不能自封内置)', loaded.ok && loaded.provider.builtin === false,
+          'builtin=' + (loaded.ok ? loaded.provider.builtin : 'n/a'));
+        ok('G15d', '自报的 complete 方法仍被保留(只改身份,不改实现)',
+          loaded.ok && typeof loaded.provider.complete === 'function');
+        // 用真实 registry 验证:该外部实现不能覆盖内置
+        const reg4 = require(path.join(PLUGINS, 'provider-registry.js'));
+        reg4.reset();
+        reg4.register(mkProvider('mimic-target', true));
+        const faker2 = { ...loaded.provider, id: 'mimic-target' };
+        ok('G15e', '伪装 builtin 的外部实现仍被内置冲突规则拦下', (() => {
+          try { reg4.register(faker2); return false; }
+          catch (e) { return protocol.isProtocolError(e) && /与内置实现冲突/.test(e.message); }
+        })(), 'builtin:false 使得它无法绕过内置保护');
+      } finally {
+        try { fs.rmSync(base, { recursive: true, force: true }); } catch {}
+      }
+    }
   }
 
   // ========== H. 插件符号链接安全 ==========

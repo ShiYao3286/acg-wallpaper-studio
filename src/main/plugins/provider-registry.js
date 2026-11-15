@@ -7,8 +7,10 @@
 //   1. 注册时立即走 describeProvider() 校验,坏 Provider 注册不进来。
 //      这样"协议错误"在注册这一刻暴露,而不是等到用户点"立即换一张"才炸。
 //   2. id 冲突规则(审核修复,2026-11-15):
-//      - 内置 Provider 幂等重复注册:允许(registry 是模块级单例,main.js 在同进程内
-//        会被多次加载,测试脚手架用 Module._load 钩子反复 loadMain 就依赖这条)。
+//      - 内置 Provider 严格幂等:同 id 已注册时,再次注册【不替换实现、不改 enabled 状态】。
+//        (registry 是模块级单例,main.js 在同进程内会被多次加载,
+//         测试脚手架用 Module._load 钩子反复 loadMain 就依赖"重复注册不报错",
+//         但"不报错"不等于"允许替换" —— 严格幂等更安全,也符合注释里说的幂等语义。)
 //      - 外部 Provider 覆盖任何已注册的内置 Provider:拒绝。
 //        否则把插件目录与 manifest.id 都写成 lolicon,启用后就能顶掉内置实现,
 //        fetchLolicon() 拿到的将是第三方代码 —— 这是可被劫持的入口。
@@ -27,38 +29,42 @@ const registry = new Map();
 // 这样重新启用时不需要重新注册。
 const disabled = new Set();
 
-function assertNotRegistered(id) {
-  if (registry.has(id)) {
-    throw new ProtocolError('Provider id 已被注册: ' + id);
+// 判断一条注册是否会与现有 registry 冲突。冲突时抛错;不冲突返回 null。
+// 抽成独立函数,供 register() 与 registerAll() 的预检共用同一套规则,
+// 避免"预检一套规则、落库另一套规则"造成两者漂移。
+function checkConflict(provider) {
+  const existing = registry.get(provider.id);
+  if (!existing) return null;                     // 无冲突
+
+  const existingBuiltin = existing.provider.builtin === true;
+  const incomingBuiltin = provider.builtin === true;
+
+  if (existingBuiltin && !incomingBuiltin) {
+    throw new ProtocolError(
+      'Provider id 与内置实现冲突,拒绝外部插件覆盖: ' + provider.id);
   }
+  if (!existingBuiltin && !incomingBuiltin) {
+    throw new ProtocolError(
+      'Provider id 已被另一个外部插件注册: ' + provider.id);
+  }
+  // 内置 vs 内置:不冲突,但调用方需按"严格幂等"处理(不替换)
+  return { existing, existingBuiltin, incomingBuiltin };
 }
 
 // 注册:raw 必须是完整 Provider 对象(含实现方法)
 //
 // 冲突规则见文件头设计约束第 2 条。要点:
-//   - 内置 vs 内置:允许(幂等重复注册)
+//   - 内置 vs 内置:严格幂等 —— 已存在则什么都不改(不替换实现、不动 enabled 状态)
 //   - 外部 vs 内置:拒绝
 //   - 外部 vs 外部:拒绝
 //   - 同批内重复:由 registerAll 拒绝
 function register(raw) {
   const provider = describeProvider(raw);   // 校验失败会抛 ProtocolError
-  const existing = registry.get(provider.id);
+  const conflict = checkConflict(provider);
 
-  if (existing) {
-    const existingBuiltin = existing.provider.builtin === true;
-    const incomingBuiltin = provider.builtin === true;
-
-    // 外部不得覆盖任何已注册的内置实现
-    if (existingBuiltin && !incomingBuiltin) {
-      throw new ProtocolError(
-        'Provider id 与内置实现冲突,拒绝外部插件覆盖: ' + provider.id);
-    }
-    // 外部与外部之间也不允许重复 id
-    if (!existingBuiltin && !incomingBuiltin) {
-      throw new ProtocolError(
-        'Provider id 已被另一个外部插件注册: ' + provider.id);
-    }
-    // 内置 vs 内置:落到下面的 set,保持幂等
+  // 严格幂等:内置已注册时直接返回现存描述,不写 registry、不动 disabled
+  if (conflict && conflict.existingBuiltin && conflict.incomingBuiltin) {
+    return { ...conflict.existing.provider };
   }
 
   registry.set(provider.id, { provider, impl: raw });
@@ -66,25 +72,43 @@ function register(raw) {
   return provider;
 }
 
-// 批量注册:任一失败则整体失败,不做"部分成功"。
-// 否则启动时一个坏内置 Provider 会导致"注册了一半"的隐晦状态。
-// 同一批内出现重复 id 属于编程错误,直接拒绝;
-// 但允许覆盖"上一轮已注册"的同 id(见 register 的幂等说明)。
+// 批量注册:真正的"任一失败则整体失败,不做部分成功"。
+//
+// 旧实现先校验批内重复、再逐条 register(),没有预先检查整批与现有 registry 的冲突,
+// 于是可能出现"前两个已落库、第三个冲突抛错"的半完成状态 —— 与注释承诺不符。
+// 现在改为【预检 -> 提交】两阶段:
+//   阶段一(只读):协议校验 + 批内重复 + 与现有 registry 冲突,全部通过才继续
+//   阶段二(写入):一次性写入,不再有任何可能失败的判断
+// 不使用"失败后回滚"来掩盖非原子实现。
 function registerAll(list) {
   if (!Array.isArray(list)) throw new ProtocolError('registerAll 需要数组');
-  const described = list.map(describeProvider);        // 先全部校验
 
-  // 同一批次内重复 id 属于编程错误:先把整批校验完再落库,避免"注册了一半"
-  const seen = new Set();
+  // ---------- 阶段一:只读预检(任何一步失败,registry 与 disabled 均不变) ----------
+  const described = list.map(describeProvider);        // 1. 协议校验
+
+  const seen = new Set();                              // 2. 批内重复
   for (const p of described) {
     if (seen.has(p.id)) throw new ProtocolError('registerAll 中存在重复 id: ' + p.id);
     seen.add(p.id);
   }
 
-  // 再逐条走 register(),复用同一套内置/外部冲突规则,不另写一份判断
+  // 3. 与现有 registry 的冲突(复用 register 的 checkConflict,规则单一来源)
+  //    内置 vs 内置不算冲突,但按严格幂等策略应跳过写入,这里先算出结果。
+  const toWrite = [];
   for (let i = 0; i < described.length; i++) {
-    register(list[i]);
+    const conflict = checkConflict(described[i]);      // 冲突会在这里抛出
+    if (conflict && conflict.existingBuiltin && conflict.incomingBuiltin) {
+      continue;                                        // 严格幂等:已存在,跳过
+    }
+    toWrite.push(i);
   }
+
+  // ---------- 阶段二:统一写入(此处不再有失败分支) ----------
+  for (const i of toWrite) {
+    registry.set(described[i].id, { provider: described[i], impl: list[i] });
+    disabled.delete(described[i].id);
+  }
+
   return described;
 }
 
