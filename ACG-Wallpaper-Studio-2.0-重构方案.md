@@ -566,3 +566,100 @@ ai-assist-prompt: ok=true, local=false, 长度 519
 | M1 | `t12` 的 Renderer 部分仍为静态核验（N1 未处理，需 DOM 环境） |
 | M2 | `t10` 小结行 `====` 前缀与其余 11 个文件不一致，导致 `run-all` 汇总该组显示空白（N2 未处理） |
 | M3 | 外部插件在渲染层尚无管理界面，目前只能通过 `api.listPlugins()` / `api.setPluginEnabled()` 调用 |
+
+### 12.8 阶段 2 审核修复批次（2026-11-15）
+
+> **状态：待独立审核**。本节记录事实，不代表已验收通过。
+
+#### 12.8.1 提交清单
+
+| # | 哈希 | 说明 |
+|---|---|---|
+| 原 1 | `6e9458c` | `fix: prevent external provider id collisions` |
+| 原 2 | `0295a78` | `fix: reject plugin symlink path escapes` |
+| 原 3 | `2eec9f1` | `fix: report config and metadata read errors` |
+| 新 1 | `aac041f` | `fix: make provider registration atomic and strictly idempotent` |
+| 新 2 | `1802df8` | `fix: correct symlink test cases H6 and H8` |
+
+#### 12.8.2 Provider 冲突规则与批量原子性
+
+| 情形 | 规则 |
+|---|---|
+| 内置 vs 内置（同 id 重复注册） | **严格幂等**：不替换实现、不改变 enabled/disabled 状态 |
+| 外部 vs 已注册内置 | 拒绝（抛 `ProtocolError`） |
+| 外部 vs 外部（同 id） | 拒绝 |
+| 同一批次内重复 id | 拒绝 |
+| 外部自报 `builtin: true` | 经 `pluginLoader.loadOne()` 后被强制改写为 `builtin: false`，无法自封内置身份 |
+
+`registerAll()` 改为**预检 → 提交**两阶段：
+
+1. 阶段一（只读）：协议校验 → 批内重复检查 → 与现有 registry 冲突检查；
+2. 阶段二（写入）：一次性落库，不再有任何可能失败的判断。
+
+任一步失败时 registry 与 enabled/disabled 状态均不发生变化。**不使用"失败后回滚"掩盖非原子实现。**
+
+#### 12.8.3 插件路径安全
+
+- `isDir()` 改用 `lstatSync`（不跟随链接），符号链接一律不算目录；
+- `isInside()` 用 `path.relative()` 而非字符串 `startsWith()`，避免 `plugin` / `plugin-evil` 前缀伪装与跨盘符误判；
+- 三级 realpath 校验：插件根目录 / 插件目录 / 入口文件；任一环节为符号链接即拒绝；
+- 根目录是符号链接时**整体拒绝扫描**（信任边界失效时子级校验不可靠）。
+
+#### 12.8.4 只读错误可观测
+
+- `get-config` 改走 `loadConfigStrict()`：ENOENT 视为首次运行不计错误，其余异常记入 `readErrors`；
+- `read-meta` 补异常记录：ENOENT 不计错误，真实读取异常（如 EISDIR）记入 `readErrors`；
+- **IPC 返回形状保持不变**：`get-config` 仍返回配置对象，`read-meta` 仍返回记录或 `null`；
+- 渲染层 17 处调用与既有 42 处断言均未改动。
+
+#### 12.8.5 插件安全模型（受信任插件模型）
+
+**必须准确理解当前的安全边界：**
+
+| 项 | 现状 |
+|---|---|
+| 外部插件默认状态 | 不执行（`plugins.enabled` 默认为空数组） |
+| 何时执行 | 仅当用户显式调用 `set-plugin-enabled(id, true)` 后 |
+| 执行方式 | 主进程内通过 Node.js `require()` 加载并运行 |
+| 隔离级别 | **无**。没有子进程、Utility Process、Worker 或任何 OS 级沙箱 |
+| 协议里的 capability 声明 | 仅为元数据与协议校验，**不构成权限控制** |
+
+**因此：启用一个外部插件，等于信任并执行其全部代码。**
+
+不得宣称已实现以下能力（当前均**未实现**）：
+
+- 文件系统访问隔离；
+- Electron API 访问隔离；
+- Node.js 内置模块访问限制；
+- 进程级或操作系统级沙箱。
+
+#### 12.8.6 测试实际状态
+
+| 项 | 数值 |
+|---|---|
+| 全量 PASS | 595 |
+| 全量 FAIL | 0 |
+| 全量 SKIP | 4 |
+
+**SKIP 明细（不得计为 PASS）：**
+
+| ID | 用例 | 原因 |
+|---|---|---|
+| H1 | 入口文件是指向外部目录的符号链接时被拒绝 | 本机 `fs.symlinkSync` 返回 `EPERM`（无开发者模式、非管理员） |
+| H2 | 入口链接指向插件目录内也被拒绝 | 同上 |
+| H6 | 循环符号链接被安全拒绝 | 同上（测试代码已修正为 `manifest.main` 指向循环链接，具备权限即可执行） |
+| H6b | 拒绝原因是入口为符号链接 | 同上 |
+
+H3/H4（目录 junction）在本机**真实执行并通过**（`mklink /J` 不需要特权）。
+**未使用 junction 冒充文件符号链接测试。**
+
+#### 12.8.7 尚未完成的外部环境补测
+
+| 项目 | 要求 |
+|---|---|
+| H1 / H2 / H6 / H6b | 需在具备文件符号链接创建权限的 Windows 环境补跑 `node tests/t17-review-fixes.js` |
+| 完整性约束 | **补测完成前，符号链接测试组不得标记为完整通过** |
+
+#### 12.8.8 最终审核状态
+
+**待独立审核。** 在独立审核者确认通过之前，阶段 2 不得宣布最终完成。
