@@ -46,7 +46,10 @@ const readJsonl = (p) => fs.readFileSync(p, 'utf8').trim().split('\n').filter(Bo
     const envNew = await mkEnv(null, REAL_D);
     const envOld = await mkEnv(BASELINE_MAIN, REAL_D);
     const rows = readJsonl(path.join(REAL_D, 'history.jsonl'));
-    ok('BA1', '真实数据 24 行可解析', rows.length === 24, '行数 ' + rows.length);
+    // 不写死行数:真实数据会随用户换图增长。校验的是"全部行可解析"而非固定条数。
+    const rawLines = fs.readFileSync(path.join(REAL_D, 'history.jsonl'), 'utf8').replace(/^\uFEFF/, '').trim().split('\n').filter(Boolean);
+    ok('BA1', '真实数据每一行都可解析', rows.length === rawLines.length && rows.length > 0,
+      '原始 ' + rawLines.length + ' 行,解析出 ' + rows.length + ' 行');
 
     // 候选文件名:所有旧格式 file + 所有新格式 histFile
     const names = [...new Set([

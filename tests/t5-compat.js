@@ -58,7 +58,11 @@ const readJsonl = (p) => fs.readFileSync(p, 'utf8').trim().split('\n').filter(Bo
   } else {
     const env = await mkEnv(REAL_D);
     const rows = readJsonl(path.join(env.wallDir, 'history.jsonl'));
-    ok('S1', '副本 history.jsonl 可完整解析 24 行', rows.length === 24, '解析出 ' + rows.length + ' 行');
+    // 不写死行数:真实 history.jsonl 会随用户换图增长(实测从 24 行变为 25 行)。
+    // 真正要保障的是"每一行都能解析",行数本身不是契约。
+    const rawLines = fs.readFileSync(path.join(env.wallDir, 'history.jsonl'), 'utf8').replace(/^\uFEFF/, '').trim().split('\n').filter(Boolean);
+    ok('S1', '副本 history.jsonl 每一行都可解析', rows.length === rawLines.length && rows.length > 0,
+      '原始 ' + rawLines.length + ' 行,解析出 ' + rows.length + ' 行');
     const oldFmt = rows.filter(r => /^hist_/.test(String(r.file)));
     const newFmt = rows.filter(r => r.histFile);
     ok('S2', '真实数据同时含旧格式(file=hist_*)与新格式(histFile)', oldFmt.length > 0 && newFmt.length > 0,
