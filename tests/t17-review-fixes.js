@@ -297,18 +297,31 @@ function mkProvider(id, builtin) {
     }
 
     // ---------- H6:循环符号链接 ----------
+    // 旧版本缺陷:manifest 没写 main,加载器默认查 index.js,
+    // 而本用例只造了 a.js/b.js 互链 —— 于是根本没走到循环链接就结束了,
+    // 断言"被跳过"其实是被"入口文件不存在"跳过的,测的不是循环链接。
+    // 现在 manifest.main 明确指向 a.js,保证加载器真的去访问循环链接。
     if (!symlinkFileOk) {
       skip('H6', '循环符号链接不崩溃', '本机无法创建文件符号链接(需开发者模式或管理员权限),待补测');
+      skip('H6b', '拒绝原因是入口为符号链接', '同上:前置条件不足,未执行');
     } else {
       const base = mkRoot();
       const root2 = path.join(base, 'plugins');
       const dir = path.join(root2, 'demo');
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(MANIFEST, null, 2), 'utf8');
-      try { fs.symlinkSync(path.join(dir, 'a.js'), path.join(dir, 'b.js'), 'file'); fs.symlinkSync(path.join(dir, 'b.js'), path.join(dir, 'a.js'), 'file'); } catch {}
+      // 关键:main 指向 a.js,让加载器必须解析它
+      fs.writeFileSync(path.join(dir, 'manifest.json'),
+        JSON.stringify(Object.assign({}, MANIFEST, { main: 'a.js' }), null, 2), 'utf8');
+      // a.js <-> b.js 互相指向,形成循环。
+      fs.symlinkSync(path.join(dir, 'b.js'), path.join(dir, 'a.js'), 'file');
+      fs.symlinkSync(path.join(dir, 'a.js'), path.join(dir, 'b.js'), 'file');
       const r = loader.discover(root2);
-      ok('H6', '循环符号链接不崩溃且被跳过', r.found.length === 0,
+      ok('H6', '循环符号链接被安全拒绝且不崩溃', r.found.length === 0 && r.skipped.length === 1,
         'skipped=' + JSON.stringify(r.skipped.map(x => x.reason)));
+      // 断言拒绝原因确实是"入口是符号链接",而不是别的偶发原因
+      ok('H6b', '拒绝原因是入口为符号链接(main 已指向循环链接,确系触发了目标路径)',
+        r.skipped.length === 1 && /符号链接/.test(r.skipped[0].reason),
+        'reason=' + (r.skipped[0] ? r.skipped[0].reason : 'n/a'));
     }
 
     // ---------- 纯函数单测(辅助,不替代真实文件系统测试) ----------
@@ -318,11 +331,15 @@ function mkProvider(id, builtin) {
       return loader.isInside(a, a) === true && loader.isInside(a, b) === false;
     })(), '不用 startsWith,避免 plugin 与 plugin-evil 误判');
 
-    ok('H8', '[纯函数] isInside 拒绝跨盘/父级路径', (() => {
+    // H8 原名声称"跨盘/父级路径",但实际只验证了父级。
+    // 跨盘判断依赖盘符存在与否,在本机无法可靠构造(且 path.relative 跨盘返回绝对路径,
+    // 已由 isAbsolute 分支覆盖),因此按实际覆盖范围改名,不再虚报覆盖面。
+    ok('H8', '[纯函数] isInside 拒绝父级路径逃逸', (() => {
       const a = path.join('C:', 'tmp', 'plugin');
-      return loader.isInside(a, path.join('C:', 'tmp')) === false
-        && loader.isInside(a, path.join(a, 'sub', 'x.js')) === true;
-    })());
+      return loader.isInside(a, path.join('C:', 'tmp')) === false       // 父级
+        && loader.isInside(a, path.join('C:', 'tmp', 'plugin2')) === false  // 兄弟目录(前缀相近)
+        && loader.isInside(a, path.join(a, 'sub', 'x.js')) === true;    // 子级
+    })(), '未覆盖跨盘场景:跨盘由 path.isAbsolute 分支兜底,本机无法可靠构造真实跨盘用例');
 
     // 用一个真实的 junction 验证 isDir 语义,而不是靠 mock。
     // junction 不可用时显式 SKIP —— 不允许"因为没有前置条件所以算通过"。
