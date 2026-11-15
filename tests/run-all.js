@@ -3,7 +3,7 @@ const { execFileSync } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 
-const files = ['t1-units.js','t2-ipc.js','t3-rollback.js','t4-history.js','t5-compat.js','t6-errors.js','t7-json.js','t8-legacy.js','t9-regression.js','t10-stage1-complete.js','t11-round2-fixes.js','t12-round3-fixes.js','t13-provider.js','t14-renderer-security.js','t15-plugin-loader.js','t16-readonly-errors.js'];
+const files = ['t1-units.js','t2-ipc.js','t3-rollback.js','t4-history.js','t5-compat.js','t6-errors.js','t7-json.js','t8-legacy.js','t9-regression.js','t10-stage1-complete.js','t11-round2-fixes.js','t12-round3-fixes.js','t13-provider.js','t14-renderer-security.js','t15-plugin-loader.js','t16-readonly-errors.js','t17-review-fixes.js'];
 const dir = __dirname;
 const all = [];
 let failedGroups = [];
