@@ -62,6 +62,14 @@ function mkSafe(o) {
     })());
     ok('A10', '未知状态被拒绝', throws(() => ap.canTransition('bogus', 'idle')) !== null);
 
+    // 阶段3 审核修复:登录中途退出必须能回 idle。
+    // 旧迁移表里 opening/awaiting_scan 没有到 idle 的路,导致
+    // "凭据已删但 UI 卡在等待扫码"的死状态。
+    ok('A15', '登录中途(opening/awaiting_scan)可回到 idle',
+      ap.canTransition('opening', 'idle') === true && ap.canTransition('awaiting_scan', 'idle') === true);
+    ok('A16', 'idle 仍不能直接跳到 authenticated(恢复流程例外,不走本表)',
+      ap.canTransition('idle', 'authenticated') === false);
+
     const mk = (arr) => new Map(arr.map(n => [n, 'v']));
     ok('A11', '完整 Cookie 判定完整', ap.checkCookieCompleteness(mk(ap.REQUIRED_COOKIES)).ok === true);
     ok('A12', '缺字段判不完整并列出缺项', (() => {
@@ -390,6 +398,18 @@ function mkSafe(o) {
     ok('H16', 'doubao-status 不返回任何 Cookie 值',
       !/sessionid|ttwid|odin_tt|s_v_web_id/.test(stStr) && typeof st.state === 'string',
       stStr.slice(0, 120));
+
+    // logout:凭据/会话清理结果必须真实反映
+    const lo = await call('doubao-logout');
+    ok('H17', 'doubao-logout 返回真实结果(有 ok 字段且状态可读)',
+      lo && typeof lo.ok === 'boolean', JSON.stringify(lo).slice(0, 140));
+
+    // 这条是修复过程中新发现的缺陷:登录中途退出会卡在 awaiting_scan
+    const stAfter = await call('doubao-status');
+    ok('H18', '登录中途退出登录能回到 idle(不卡在 awaiting_scan)',
+      stAfter.state === 'idle', '退出后 state=' + stAfter.state);
+
+    try { closeAllWatchers(); } catch {}
   }
 
   // ==========================================================================
@@ -475,6 +495,155 @@ function mkSafe(o) {
       return m[1].includes("'authenticated'") && m[1].includes("'awaiting_scan'");
     })(), '命中 needsManageAction 判断');
   }
+
+  // ==========================================================================
+  // G 组 —— 阶段3 审核修复:logout 错误处理 与 失败路径 Session 清理
+  // 对应问题:
+  //   1) logout 吞掉异常仍返回 {ok:true} → 凭据没删掉却报"已退出";
+  //   2) 取消/超时/开窗失败/保存失败等路径从不清理 Session Cookie。
+  // ==========================================================================
+  group('G 退出与失败路径清理');
+  {
+    const FULL = ap.REQUIRED_COOKIES.slice();
+    function mkEnv(o) {
+      const opt = o || {};
+      const rec = { opened: 0, closed: 0, cleared: 0, stored: null, clearReasons: [] };
+      let cookieQueue = opt.cookieQueue || [[]];
+      let pollIdx = 0;
+      am.__reset();
+      am.init({
+        openLoginWindow: async () => { rec.opened++; return opt.openResult || { ok: true }; },
+        closeLoginWindow: () => { rec.closed++; },
+        clearSession: async () => {
+          rec.cleared++;
+          if (opt.clearSessionThrows) throw new Error('session clear boom');
+          if (opt.clearSessionResult) return opt.clearSessionResult;
+          return { ok: true, removed: 3, failed: [], errors: [] };
+        },
+        credential: {
+          async save(p) { if (opt.saveThrows) throw new Error('disk full'); rec.stored = [...p.keys()]; },
+          async has() { if (opt.hasThrows) throw new Error('has boom'); return opt.hasValue !== undefined ? opt.hasValue : rec.stored !== null; },
+          async clear() {
+            if (opt.clearThrows) throw new Error('credential clear boom');
+            if (opt.clearLeavesCredential) { rec.stored = ['still-here']; return; }
+            rec.stored = null;
+          },
+        },
+        readSessionCookies: async () => {
+          const m = new Map();
+          const arr = cookieQueue[Math.min(pollIdx, cookieQueue.length - 1)] || [];
+          pollIdx++;
+          arr.forEach(n => m.set(n, 'v-' + n));
+          return m;
+        },
+        pollIntervalMs: 5, scanTimeoutMs: opt.scanTimeoutMs || 60000,
+        setTimer: (fn, ms) => setTimeout(fn, ms),
+        clearTimer: (t) => clearTimeout(t),
+        now: () => Date.now(),
+      });
+      return rec;
+    }
+
+    // --- 退出登录的正常与异常路径 ---
+    let r1 = mkEnv({ cookieQueue: [FULL] });
+    await am.beginLogin(); await sleep(80);
+    const out1 = await am.logout();
+    ok('G1', '正常退出:凭据与 Session 都清成功才报成功',
+      out1.ok === true && out1.credentialCleared === true && out1.sessionCleared === true &&
+      out1.credentialRemaining === false && am.getState().state === 'idle',
+      JSON.stringify({ ok: out1.ok, cc: out1.credentialCleared, sc: out1.sessionCleared }));
+
+    let r2 = mkEnv({ cookieQueue: [FULL], clearThrows: true });
+    await am.beginLogin(); await sleep(80);
+    const out2 = await am.logout();
+    ok('G2', '凭据删除失败时不得报成功', out2.ok === false && out2.credentialCleared === false,
+      JSON.stringify({ ok: out2.ok, errors: out2.errors.length }));
+    ok('G2b', '凭据删除失败时状态不伪装成完全退出',
+      am.getState().state === 'authenticated' && out2.credentialRemaining === true,
+      'state=' + am.getState().state);
+
+    let r3 = mkEnv({ cookieQueue: [FULL], clearSessionResult: { ok: false, removed: 1, failed: ['sessionid'], errors: ['删除 Cookie 失败(sessionid): mock'] } });
+    await am.beginLogin(); await sleep(80);
+    const out3 = await am.logout();
+    ok('G3', 'Session 清理失败时不得报完整成功',
+      out3.ok === false && out3.sessionCleared === false && out3.credentialCleared === true,
+      JSON.stringify({ ok: out3.ok, sc: out3.sessionCleared }));
+
+    let r4 = mkEnv({ cookieQueue: [FULL], clearThrows: true, clearSessionResult: { ok: false, removed: 0, failed: ['x'], errors: ['mock fail'] } });
+    await am.beginLogin(); await sleep(80);
+    const out4 = await am.logout();
+    ok('G4', '两者同时失败仍能明确报告失败',
+      out4.ok === false && out4.credentialCleared === false && out4.sessionCleared === false &&
+      out4.errors.length >= 1, out4.errors.join(' | ').slice(0, 120));
+
+    let r5 = mkEnv({ cookieQueue: [FULL], clearSessionThrows: true });
+    await am.beginLogin(); await sleep(80);
+    const out5 = await am.logout();
+    ok('G5', 'Session 清理抛异常被捕获且不报成功',
+      out5.ok === false && /Session/.test(out5.errors.join(' ')));
+
+    ok('G6', '错误信息不含 Cookie 值(只有名字/原因)',
+      [out1, out2, out3, out4, out5].every(o => (o.errors || []).every(e => !/v-sessionid|v-uid_tt|v-ttwid/.test(e))),
+      '已检查 ' + [out1, out2, out3, out4, out5].reduce((a, o) => a + (o.errors || []).length, 0) + ' 条错误消息');
+
+    let r7 = mkEnv({ cookieQueue: [FULL], clearLeavesCredential: true, hasValue: true });
+    await am.beginLogin(); await sleep(80);
+    const out7 = await am.logout();
+    ok('G7', 'clear() 不抛错但凭据仍在时,以 has() 复核结果为准',
+      out7.credentialRemaining === true && out7.ok === false,
+      'credentialRemaining=' + out7.credentialRemaining);
+
+    // --- 失败/取消路径的 Session 清理 ---
+    let r8 = mkEnv({ cookieQueue: [[]] });
+    await am.beginLogin();
+    const c8 = await am.cancelLogin('用户取消');
+    ok('G8', '取消登录会清理 Session', r8.cleared > 0 && c8.cleanup && c8.cleanup.ok === true,
+      'cleared=' + r8.cleared);
+
+    let r9 = mkEnv({ cookieQueue: [[]], scanTimeoutMs: 10 });
+    await am.beginLogin(); await sleep(70);
+    ok('G9', '扫码超时会清理 Session', r9.cleared > 0 && am.getState().state === 'error',
+      'cleared=' + r9.cleared);
+
+    let r10 = mkEnv({ openResult: { ok: false, error: '模拟开窗失败' } });
+    const b10 = await am.beginLogin();
+    ok('G10', '开窗失败会清理 Session', r10.cleared > 0 && b10.ok === false && b10.cleanup && b10.cleanup.ok === true,
+      'cleared=' + r10.cleared);
+
+    let r11 = mkEnv({ cookieQueue: [FULL], saveThrows: true });
+    await am.beginLogin(); await sleep(80);
+    ok('G11', '凭据保存失败会清理 Session',
+      r11.cleared > 0 && am.getState().state === 'error' && /凭据保存失败/.test(am.getState().lastError),
+      'cleared=' + r11.cleared);
+
+    // 登录成功后不得被"关窗→取消"误清理(竞态)
+    let r12 = mkEnv({ cookieQueue: [FULL] });
+    await am.beginLogin(); await sleep(80);
+    ok('G12', '前置:已成功登录', am.getState().state === 'authenticated' && r12.stored !== null);
+    const clearedBefore = r12.cleared;
+    const c12 = await am.cancelLogin('窗口关闭');
+    ok('G13', '成功登录后不会被取消流程误清 Session',
+      r12.cleared === clearedBefore && c12.ok === false && am.getState().state === 'authenticated',
+      'cleared ' + clearedBefore + ' -> ' + r12.cleared);
+
+    // 重复取消不破坏状态
+    let r14 = mkEnv({ cookieQueue: [[]] });
+    await am.beginLogin();
+    const cc1 = await am.cancelLogin('第一次');
+    const cc2 = await am.cancelLogin('第二次');
+    ok('G14', '重复取消:第二次被拒绝且不重复清 Session',
+      cc1.ok === true && cc2.ok === false && r14.cleared === 1,
+      'cleared=' + r14.cleared);
+
+    // Session 清理失败要能被诊断到(记进 lastError),但不含 Cookie
+    let r15 = mkEnv({ cookieQueue: [[]], clearSessionThrows: true });
+    await am.beginLogin();
+    await am.cancelLogin('用户取消');
+    ok('G15', '清理失败被记录为可诊断状态',
+      /清理/.test(am.getState().lastError) && !/v-sessionid/.test(am.getState().lastError),
+      'lastError=' + am.getState().lastError.slice(0, 60));
+  }
+
 
   group('D Provider 协议兼容');
   {

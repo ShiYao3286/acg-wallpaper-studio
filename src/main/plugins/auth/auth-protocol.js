@@ -31,8 +31,16 @@ const AUTH_STATES = ['idle', 'opening', 'awaiting_scan', 'authenticated', 'expir
 // 刻意写成白名单而非"排除法":非法迁移必须显式拒绝,不能靠遗漏。
 const TRANSITIONS = {
   idle:          ['opening'],
-  opening:       ['awaiting_scan', 'error', 'cancelled'],
-  awaiting_scan: ['authenticated', 'cancelled', 'error'],
+  // opening / awaiting_scan 都允许直接回 idle。
+  //
+  // 为什么必须加(阶段3 审核修复中发现的真实缺陷):
+  // 用户在"正在打开窗口"或"等待扫码"时点【退出账号】,
+  // 旧迁移表里这两个状态只能去 error / cancelled,没有到 idle 的路,
+  // 于是 logout() 里的 canTransition(state,'idle') 判 false,
+  // 状态就永远卡在 awaiting_scan —— 凭据已经删了,UI 却还显示"等待扫码"。
+  // 这是"退出登录"这条止损路径上的死状态,必须堵掉。
+  opening:       ['awaiting_scan', 'error', 'cancelled', 'idle'],
+  awaiting_scan: ['authenticated', 'cancelled', 'error', 'idle'],
   authenticated: ['idle', 'expired', 'opening'],   // 退出登录 / 凭据失效 / 重新登录
   expired:       ['opening', 'idle'],              // 重新扫码 或 主动退出
   cancelled:     ['opening', 'idle'],              // 再次尝试 或 回到未登录

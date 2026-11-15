@@ -243,23 +243,50 @@ async function readDoubaoSessionCookies() {
 }
 
 // 清理专用 session 里豆包相关的 Cookie。不动其他域名、不动主窗口 session。
+//
+// 返回值改成 { ok, removed, failed, errors }:
+//   - 阶段3 审核指出旧实现把所有异常都吞进空 catch,调用方永远不知道清没清干净,
+//     logout() 因此可以"删失败但仍报成功"。
+//   - 现在逐个 Cookie 记录成功/失败,单个失败不影响其余继续删(尽可能清干净),
+//     最终由调用方根据 failed 是否为 0 决定能不能报告"完整退出"。
+//   - errors 里只放错误消息与 Cookie 名,【绝不含 Cookie 值】。
 async function clearDoubaoSession() {
   const ses = getDoubaoSession();
+  let removed = 0;
+  const failed = [];
+  const errors = [];
+  const removedNames = [];
   for (const url of DOUBAO_COOKIE_URLS) {
+    let list = [];
     try {
-      const list = await ses.cookies.get({ url });
-      for (const c of list) {
-        if (!c || !c.name) continue;
-        const scheme = c.secure ? 'https://' : 'http://';
-        const domain = String(c.domain || '').replace(/^\./, '');
-        if (!domain) continue;
-        try {
-          await ses.cookies.remove(scheme + domain + (c.path || '/'), c.name);
-        } catch {}
+      list = await ses.cookies.get({ url });
+    } catch (e) {
+      failed.push(url);
+      errors.push('读取 Cookie 失败: ' + ((e && e.message) || String(e)));
+      continue;
+    }
+    for (const c of list) {
+      if (!c || !c.name) continue;
+      const scheme = c.secure ? 'https://' : 'http://';
+      const domain = String(c.domain || '').replace(/^\./, '');
+      if (!domain) continue;
+      try {
+        await ses.cookies.remove(scheme + domain + (c.path || '/'), c.name);
+        removed += 1;
+        removedNames.push(c.name);
+      } catch (e) {
+        // 只记名字与原因,不记值
+        failed.push(c.name);
+        errors.push('删除 Cookie 失败(' + c.name + '): ' + ((e && e.message) || String(e)));
       }
-    } catch {}
+    }
   }
-  try { await ses.cookies.flushStore(); } catch {}
+  let flushed = true;
+  try { await ses.cookies.flushStore(); } catch (e) {
+    flushed = false;
+    errors.push('flushStore 失败: ' + ((e && e.message) || String(e)));
+  }
+  return { ok: failed.length === 0 && flushed, removed, failed, errors, removedNames };
 }
 
 // 认证管理器初始化:依赖全部注入,状态变化时刷新 UI
@@ -1129,17 +1156,41 @@ ipcMain.handle('doubao-login', async () => {
 ipcMain.handle('doubao-cancel-login', async () => {
   try {
     const r = await authManager.cancelLogin('用户取消');
-    return r.ok ? ok({ state: r.state }) : fail(r.error || '取消失败', ERROR_CODES.E_STATE);
+    if (!r.ok) return fail(r.error || '取消失败', ERROR_CODES.E_STATE);
+    // 取消本身成功,但 Session 清理可能没做完 —— 如实附带,不含 Cookie 内容
+    const cleanupOk = !(r.cleanup && r.cleanup.ok === false);
+    return ok({ state: r.state, sessionCleaned: cleanupOk });
   } catch (e) {
     return failFrom(e, ERROR_CODES.E_STATE);
   }
 });
 
+// 退出登录。
+//
+// 阶段3 审核指出的问题:旧实现是
+//   await authManager.logout();
+//   return ok({ state: 'idle' });      // ← 丢掉返回值,永远报成功
+// 即使凭据没删掉、Session 没清干净,UI 也显示"已退出"。
+// 现在必须检查 logout() 的实际结果,只把真实情况告诉渲染层。
 ipcMain.handle('doubao-logout', async () => {
   try {
-    await authManager.logout();
+    const r = await authManager.logout();
     credentialService.invalidateCache();
-    return ok({ state: 'idle' });
+    if (r && r.ok) return ok({ state: r.state, credentialCleared: true, sessionCleared: true });
+    // 部分失败:明确告诉渲染层哪一步没成,不做"看起来成功"的包装。
+    // 错误消息来自 authManager,内部已保证不含 Cookie 值。
+    const reasons = (r && Array.isArray(r.errors) && r.errors.length)
+      ? r.errors.join('; ')
+      : '清理未完成,凭据可能仍然存在';
+    return fail(
+      '退出未完成: ' + reasons,
+      ERROR_CODES.E_STATE,
+      {
+        state: (r && r.state) || authManager.getState().state,
+        credentialRemaining: !!(r && r.credentialRemaining),
+        sessionCleared: !!(r && r.sessionCleared),
+      }
+    );
   } catch (e) {
     return failFrom(e, ERROR_CODES.E_STATE);
   }
