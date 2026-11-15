@@ -255,6 +255,128 @@ function mkProvider(id, builtin) {
     cleanup();
   }
 
+  // ========== K. 只读通道错误记录 ==========
+  group('K 只读通道错误记录');
+  {
+    const os = require('node:os');
+    const { loadMain, waitBoot, closeAllWatchers } = require('./harness');
+
+    const tmpRoots = [];
+    async function mkEnv() {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'acg-k17-'));
+      tmpRoots.push(base);
+      const userData = path.join(base, 'userData');
+      const pictures = path.join(base, 'Pictures');
+      const wallDir = path.join(pictures, 'ACG_Wallpaper');
+      const confDir = path.join(userData, 'config');
+      fs.mkdirSync(confDir, { recursive: true });
+      fs.mkdirSync(wallDir, { recursive: true });
+      const loaded = loadMain({ userDataDir: userData, picturesDir: pictures, holdReady: false, singleInstanceLock: true });
+      await waitBoot(loaded.state, 5000);
+      const call = async (ch, ...a) => { const fn = loaded.state.ipcHandlers.get(ch); return await fn({}, ...a); };
+      return { base, userData, pictures, wallDir, confDir, confFile: path.join(confDir, 'config.json'), call };
+    }
+
+    // ---------- K1 正常无错误 ----------
+    {
+      const e = await mkEnv();
+      const st = await e.call('get-status');
+      ok('K1', 'get-config 正常时 readErrors 为空', Object.keys(st.readErrors).length === 0,
+        'readErrors=' + JSON.stringify(st.readErrors));
+      closeAllWatchers();
+    }
+
+    // ---------- K2 config 损坏 -> 记错误,返回形状不变 ----------
+    {
+      const e = await mkEnv();
+      fs.writeFileSync(e.confFile, '{ broken json', 'utf8');
+      const cfg = await e.call('get-config');
+      const st = await e.call('get-status');
+      ok('K2', 'config 损坏时返回配置对象(形状不变)', typeof cfg === 'object' && cfg !== null && typeof cfg.source === 'string',
+        'source=' + (cfg && cfg.source));
+      ok('K3', 'config 损坏时 readErrors[get-config] 有值',
+        typeof st.readErrors['get-config'] === 'string' && st.readErrors['get-config'].length > 0,
+        '记录=' + String(st.readErrors['get-config']).slice(0, 60));
+      closeAllWatchers();
+    }
+
+    // ---------- K4 config 不存在(ENOENT)按首次使用,不算错误 ----------
+    {
+      const e = await mkEnv();
+      fs.rmSync(e.confFile, { force: true });
+      const cfg = await e.call('get-config');
+      const st = await e.call('get-status');
+      ok('K4', 'config 不存在时返回默认配置', typeof cfg === 'object' && cfg !== null && cfg.source === 'lolicon');
+      ok('K5', 'config 不存在(ENOENT)不计入 readErrors', !st.readErrors['get-config'],
+        '首次使用不是错误;实际=' + JSON.stringify(st.readErrors['get-config'] || null));
+      closeAllWatchers();
+    }
+
+    // ---------- K6 history.jsonl 被目录占据(EISDIR/ENOTDIR) ----------
+    {
+      const e = await mkEnv();
+      fs.mkdirSync(path.join(e.wallDir, 'history.jsonl'));
+      const m = await e.call('read-meta', 'x.jpg');
+      const st = await e.call('get-status');
+      ok('K6', 'read-meta 读取失败时返回 null(形状不变)', m === null);
+      ok('K7', 'read-meta 真实读取异常被记录',
+        typeof st.readErrors['read-meta'] === 'string' && st.readErrors['read-meta'].length > 0,
+        '记录=' + String(st.readErrors['read-meta']).slice(0, 60));
+      closeAllWatchers();
+    }
+
+    // ---------- K8 history.jsonl 不存在(ENOENT)按首次使用 ----------
+    {
+      const e = await mkEnv();
+      const m = await e.call('read-meta', 'x.jpg');
+      const st = await e.call('get-status');
+      ok('K8', 'history.jsonl 不存在时返回 null', m === null);
+      ok('K9', 'history.jsonl 不存在(ENOENT)不计入 readErrors', !st.readErrors['read-meta'],
+        '实际=' + JSON.stringify(st.readErrors['read-meta'] || null));
+      closeAllWatchers();
+    }
+
+    // ---------- K10 失败后恢复,错误应被清除 ----------
+    {
+      const e = await mkEnv();
+      fs.mkdirSync(path.join(e.wallDir, 'history.jsonl'));
+      await e.call('read-meta', 'x.jpg');
+      const stBad = await e.call('get-status');
+      const hadError = !!stBad.readErrors['read-meta'];
+      // 恢复成正常文件
+      fs.rmdirSync(path.join(e.wallDir, 'history.jsonl'));
+      fs.writeFileSync(path.join(e.wallDir, 'history.jsonl'), JSON.stringify({ file: 'x.jpg', time: 't' }) + '\n', 'utf8');
+      const hit = await e.call('read-meta', 'x.jpg');
+      const stGood = await e.call('get-status');
+      ok('K10', '读取恢复正常后 readErrors 被清除',
+        hadError && hit !== null && !stGood.readErrors['read-meta'],
+        '故障时=' + hadError + ' 恢复后命中=' + (hit !== null) + ' 残留=' + JSON.stringify(stGood.readErrors['read-meta'] || null));
+      closeAllWatchers();
+    }
+
+    // ---------- K11 get-status 契约未变 ----------
+    {
+      const e = await mkEnv();
+      const st = await e.call('get-status');
+      ok('K11', 'get-status 原有字段未受影响',
+        typeof st.sourceLabel === 'string' && 'lastInfo' in st && 'imageModels' in st
+        && 'currentPath' in st && 'scriptMeta' in st && typeof st.readErrors === 'object');
+      closeAllWatchers();
+    }
+
+    // ---------- K12 get-config 返回形状与旧实现等价 ----------
+    {
+      const e = await mkEnv();
+      const c = await e.call('get-config');
+      ok('K12', 'get-config 仍返回完整配置对象',
+        c && typeof c === 'object' && 'source' in c && 'lolicon' in c && 'services' in c && 'ai' in c && 'plugins' in c,
+        '顶层键数=' + (c ? Object.keys(c).length : 0));
+      closeAllWatchers();
+    }
+
+    for (const d of tmpRoots) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  }
+
   const s = summarize();
   console.log('');
   console.log('---- 第十七部分小结: ' + s.passed + '/' + s.total + ' 通过, ' + s.failed + ' 失败' + (s.skipped ? ', ' + s.skipped + ' 跳过' : '') + ' ----');

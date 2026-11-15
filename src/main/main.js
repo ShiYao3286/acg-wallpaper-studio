@@ -372,7 +372,22 @@ const applySchedule = (cfg) => scheduler.applySchedule(cfg);
 //   get-autorun     : 直接读系统登录项,失败由 Electron 抛出(属环境异常,不静默)。
 //   read-meta       : 文件缺失/解析失败返回 null(明确表示"没有这条元数据"),不自造记录。
 // 共同原则:只读通道不得静默吞掉错误后伪造成功数据,失败必须表现为"空/默认/null"这类可辨识的安全值。
-ipcMain.handle('get-config', () => loadConfig());
+// get-config(阶段2 审核修复):区分"首次运行"与"真读取异常"并记录
+// 旧实现直接调 loadConfig(),而 loadConfig 内部 catch 后静默回退默认配置,
+// 调用方完全无法得知"拿到的是用户配置还是一份默认值兜底"。
+// 改用 loadConfigStrict():它内部已把 ENOENT 当作首次运行返回 {exists:false},
+// 能走到 catch 的都是真异常(JSON 解析失败/权限/磁盘),正好符合"ENOENT 不计错误"。
+ipcMain.handle('get-config', async () => {
+  try {
+    const strict = await configService.loadConfigStrict();
+    clearReadError('get-config');
+    return strict.cfg;
+  } catch (err) {
+    noteReadError('get-config', err);
+    // 返回形状保持不变:仍是配置对象(内容为默认值兜底)
+    return await loadConfig();
+  }
+});
 const CONFIG_TOP_KEYS = new Set(Object.keys(DEFAULT_CONFIG));
 ipcMain.handle('save-config', async (e, key, val) => {
   // key 支持 a.b.c 点路径;顶层键必须在默认配置白名单内,并拦截原型污染键
@@ -1029,14 +1044,21 @@ ipcMain.handle('read-meta', async (e, rawFileName) => {
     }
     // 1. 新格式:归档时回写的 histFile 字段,与 hist_*.jpg 一一对应
     for (let i = parsed.length - 1; i >= 0; i--) {
-      if (parsed[i].histFile === fileName) return parsed[i];
+      if (parsed[i].histFile === fileName) { clearReadError('read-meta'); return parsed[i]; }
     }
     // 2. 旧格式:旧脚本把历史图当时作为独立记录写下的 file 字段
     for (let i = parsed.length - 1; i >= 0; i--) {
-      if (parsed[i].file === fileName) return parsed[i];
+      if (parsed[i].file === fileName) { clearReadError('read-meta'); return parsed[i]; }
     }
+    // 走到这里说明读取成功、只是没有匹配记录 —— 属于正常结果,清掉历史错误
+    clearReadError('read-meta');
     return null;
-  } catch { return null; }
+  } catch (err) {
+    // ENOENT:没有 history.jsonl 属于"首次使用/旧脚本产物",不算读取错误
+    if (err && err.code === 'ENOENT') { clearReadError('read-meta'); return null; }
+    noteReadError('read-meta', err);
+    return null;   // 返回形状保持不变
+  }
 });
 
 // ---------- 窗口与生命周期 ----------
