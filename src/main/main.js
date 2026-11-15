@@ -5,12 +5,19 @@ const fs = require('fs');
 const fsp = fs.promises;
 const { DEFAULT_CONFIG, buildRandomPrompt } = require('../shared/defaults');
 const { stripBom } = require('../shared/text');
-const { ok } = require('../shared/contracts');
-const { assertService, assertPreset, assertId, assertKind, assertReason, assertApiBase, argFail } = require('./validate');
+const { ok, fail, failFrom, ERROR_CODES } = require('../shared/contracts');
+const { assertService, assertPreset, assertId, assertKind, assertReason, assertApiBase,
+  assertTag, assertRandomMode, assertTheme, assertBool,
+  assertServiceField, assertPresetField, assertArrayIndex, assertFavoriteName, argFail } = require('./validate');
+// 拆分出的三个子模块(依赖方向:main.js -> services/system,子模块不反向依赖 main.js)
+const configService = require('./services/config-service');
+const scheduler = require('./system/scheduler');
+const trayMod = require('./system/tray');
 
 let win = null;
 let tray = null;
-let scheduleTimer = null;
+// 定时器实例由 system/scheduler 自己持有,main.js 不再保留 scheduleTimer,
+// 需要的状态统一通过 scheduler.isRunning() 查询。
 let lastInfo = '';
 let lastRun = null;   // { time, ok, detail }
 let changing = false;
@@ -68,48 +75,16 @@ function releaseChanging() {
 }
 
 // ---------- 配置存取 ----------
-const confDir = () => path.join(app.getPath('userData'), 'config');
-const confFile = () => path.join(confDir(), 'config.json');
-
-async function loadConfig() {
-  try {
-    const raw = await fsp.readFile(confFile(), 'utf8');
-    // 外部工具(如 PowerShell 5.1 的 Set-Content -Encoding UTF8)可能写出带 BOM 的 JSON;
-    // 不剥 BOM 会让 JSON.parse 抛错并落入下面的 catch,直接返回默认配置,
-    // 用户的全部设置与 API Key 会在内存中静默丢失。stripBom 对无 BOM 文本是恒等函数。
-    return deepMerge(structuredClone(DEFAULT_CONFIG), JSON.parse(stripBom(raw)));
-  } catch {
-    return structuredClone(DEFAULT_CONFIG);
-  }
-}
-const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-function deepMerge(base, over) {
-  for (const k of Object.keys(over)) {
-    if (FORBIDDEN_KEYS.has(k)) continue; // 防原型污染
-    if (over[k] && typeof over[k] === 'object' && !Array.isArray(over[k]) && base[k] && typeof base[k] === 'object') {
-      deepMerge(base[k], over[k]);
-    } else base[k] = over[k];
-  }
-  return base;
-}
+// 实现已迁至 services/config-service.js;这里只做转发 + 保存后重新应用调度。
+// applySchedule 是副作用,留在 main.js 触发,使 config-service 不需要反向依赖 scheduler。
+configService.init({ userDataDir: app.getPath('userData') });
+const confDir = configService.confDir;
+const confFile = configService.confFile;
+const deepMerge = configService.deepMerge;
+const FORBIDDEN_KEYS = configService.FORBIDDEN_KEYS;
+const loadConfig = () => configService.loadConfig();
 async function saveConfig(patch) {
-  await fsp.mkdir(confDir(), { recursive: true });
-  const cfg = deepMerge(await loadConfig(), patch);
-  // 原子写:先写同目录临时文件再 rename(同盘 rename 是原子的)。
-  // 直接覆盖写若中途断电/强杀,config.json 会被截断,下次 loadConfig 只能回退默认配置,
-  // 用户的全部设置与 API Key 会一次性丢失。
-  const target = confFile();
-  // 临时文件名必须唯一:固定的 .tmp 会让并发保存(如连续拖动开关)互相 rename,
-  // 后完成的一方把先完成方的临时文件搬走,另一方 rename 时报 ENOENT。
-  const tmpFile = target + '.' + process.pid + '.' + Math.random().toString(36).slice(2, 8) + '.tmp';
-  try {
-    await fsp.writeFile(tmpFile, JSON.stringify(cfg, null, 2), 'utf8');
-    await fsp.rename(tmpFile, target);
-  } catch (err) {
-    // 失败时清掉临时文件,避免配置目录堆积残片
-    try { await fsp.unlink(tmpFile); } catch {}
-    throw err;
-  }
+  const cfg = await configService.saveConfig(patch);
   applySchedule(cfg);
   return cfg;
 }
@@ -190,6 +165,25 @@ function netErr(e) {
     return '无法连接到 ' + (e?.config?.url || '服务器') + ' — 请确认服务/网关已启动、端口正确';
   }
   return msg;
+}
+
+// 把异常映射到契约里的错误码。分类依据是失败的"性质",而不是发生的位置,
+// 这样调用方(渲染层/后续阶段)能按 code 做机器判断,不必解析中文文案。
+function classifyError(e) {
+  const msg = (e && e.message) ? e.message : String(e || '');
+  // 网络/远端:连接失败、超时、HTTP 非 2xx
+  if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|aborted|timeout|HTTP \d{3}|connect/i.test(msg)) {
+    return ERROR_CODES.E_NET;
+  }
+  // 本地文件读写
+  if (/EACCES|EPERM|ENOENT|EISDIR|ENOSPC|EBUSY|EMFILE|disk|write|read|rename|copyfile|unlink/i.test(msg)) {
+    return ERROR_CODES.E_IO;
+  }
+  // 目标资源不存在(如未配置服务、文件不存在)
+  if (/未找到|不存在|没有壁纸/.test(msg)) return ERROR_CODES.E_NOT_FOUND;
+  // 状态冲突(如正在换图中)
+  if (/正在换图|已在换图|busy/i.test(msg)) return ERROR_CODES.E_STATE;
+  return ERROR_CODES.E_IO;
 }
 
 async function fetchAI(cfg, serviceId, finalPrompt) {
@@ -494,17 +488,23 @@ async function rollbackWallpaper(tx) {
   return errs;
 }
 
-// 组装带回滚信息的错误结果:原始错误优先,回滚错误附加说明
+// 组装带回滚信息的错误结果:原始错误优先,回滚错误附加说明。
+// 契约要求:
+//   - 带回滚异常时 code 固定为 E_ROLLBACK(失败的性质已从"业务失败"变成"回滚也坏了");
+//   - originalError 与 rollbackErrors 同时保留,便于排查而不用拼接文案反推;
+//   - 无回滚异常时 code 由原始错误性质决定(E_NET/E_IO/E_NOT_FOUND/E_STATE)。
 function buildFailureResult(originalErr, rollbackErrs) {
   const base = originalErr && originalErr.message ? originalErr.message : String(originalErr);
   lastRun = { time: nowStr(), ok: false, detail: base + (rollbackErrs.length ? ' | 回滚异常' : '') };
-  if (!rollbackErrs.length) return { ok: false, error: base };
-  return {
-    ok: false,
+  if (!rollbackErrs.length) {
+    // failFrom 是契约里的统一构造器,这里首次在生产代码中启用
+    return failFrom(originalErr, classifyError(originalErr));
+  }
+  return failFrom(originalErr, ERROR_CODES.E_ROLLBACK, {
     error: base + ' (回滚也出现问题: ' + rollbackErrs.join('; ') + ')',
     originalError: base,
     rollbackErrors: rollbackErrs,
-  };
+  });
 }
 
 async function pruneHistory(cfg) {
@@ -520,13 +520,9 @@ async function pruneHistory(cfg) {
 }
 
 // ---------- 调度 ----------
-function applySchedule(cfg) {
-  if (scheduleTimer) { clearInterval(scheduleTimer); scheduleTimer = null; }
-  if (!cfg.schedule.enabled) return;
-  const ms = Math.max(1, cfg.schedule.intervalMinutes) * 60000;
-  scheduleTimer = setInterval(() => changeWallpaper('schedule').catch(() => {}), ms);
-  scheduleTimer.unref && scheduleTimer.unref();
-}
+// 实现已迁至 system/scheduler.js;换图动作以回调注入,避免子模块反向依赖 main.js。
+scheduler.init({ onChange: () => changeWallpaper('schedule') });
+const applySchedule = (cfg) => scheduler.applySchedule(cfg);
 
 // ---------- 联动:监听壁纸目录(旧脚本动作实时感知) ----------
 let wallWatcher = null;
@@ -577,73 +573,100 @@ function disableOldTask() {
 }
 
 // ---------- 托盘 ----------
-function trayIcon() {
-  // 优先使用应用图标,托盘缩到 16x16
-  try {
-    const p = path.join(__dirname, '../../assets/icon.png');
-    const img = nativeImage.createFromPath(p).resize({ width: 16, height: 16 });
-    if (!img.isEmpty()) return img;
-  } catch {}
-  const size = 16;
-  const buf = Buffer.alloc(size * size * 4);
-  for (let i = 0; i < size * size; i++) {
-    buf[i * 4] = 0x7c; buf[i * 4 + 1] = 0x6c; buf[i * 4 + 2] = 0xff; buf[i * 4 + 3] = 0xff;
-  }
-  return nativeImage.createFromBuffer(buf, { width: size, height: size });
-}
-function buildTrayMenu() {
-  // tray 可能尚未创建或已销毁:菜单点击回调、配置保存、自愈后刷新都会走到这里
-  if (!tray || tray.isDestroyed()) return;
-  const menu = Menu.buildFromTemplate([
-    { label: '立即换一张 (Lolicon)', click: () => changeWallpaper('manual') },
-    { label: 'AI 生成壁纸', click: () => changeWallpaper('ai') },
-    { type: 'separator' },
-    { label: '显示主界面', click: () => { win.show(); } },
-    { label: '退出', click: () => { app.quit(); } },
-  ]);
-  tray.setContextMenu(menu);
-  // 优先显示最近动作:lastRun 是换图结果,lastInfo 是更一般的状态文案(含启动自愈提示)。
-  // 只读 lastRun 会让"已从归档恢复 current.jpg"这类自愈消息无处显示,托盘一直停在"就绪"。
-  const tipText = lastRun ? ('上次: ' + lastRun.time + (lastRun.ok ? ' 成功' : ' 失败'))
-    : (lastInfo ? lastInfo : '就绪');
-  tray.setToolTip('ACG壁纸工作室 - ' + tipText);
-}
+// 实现已迁至 system/tray.js;全局状态通过 getter 注入,子模块不持有 main.js 的变量。
+trayMod.init({
+  getTray: () => tray,
+  getWin: () => win,
+  getLastRun: () => lastRun,
+  getLastInfo: () => lastInfo,
+  onChangeWallpaper: (reason) => changeWallpaper(reason),
+});
+const trayIcon = () => trayMod.trayIcon();
+const buildTrayMenu = () => trayMod.buildTrayMenu();
 
 // ---------- 工具 ----------
 const nowStr = () => new Date().toLocaleString('zh-CN', { hour12: false });
 const ts = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()); };
 
 // ---------- IPC ----------
+// 只读通道的失败约定(阶段1):
+//   get-config      : 读取/解析失败时 loadConfig 内部已回退到默认配置并返回(安全默认值),
+//                     调用方拿到的一定是完整可用对象;不抛错,避免渲染层启动链路被一个坏配置卡死。
+//   list-history    : 目录不可读时返回 []（空列表 = 无可展示项,UI 自然降级）。
+//   list-favorites  : 同上,并会尝试 mkdir 自愈。
+//   list-services   : 配置读失败时 services 为空数组(loadConfig 已兜底)。
+//   get-autorun     : 直接读系统登录项,失败由 Electron 抛出(属环境异常,不静默)。
+//   read-meta       : 文件缺失/解析失败返回 null(明确表示"没有这条元数据"),不自造记录。
+// 共同原则:只读通道不得静默吞掉错误后伪造成功数据,失败必须表现为"空/默认/null"这类可辨识的安全值。
 ipcMain.handle('get-config', () => loadConfig());
 const CONFIG_TOP_KEYS = new Set(Object.keys(DEFAULT_CONFIG));
-ipcMain.handle('save-config', (e, key, val) => {
+ipcMain.handle('save-config', async (e, key, val) => {
   // key 支持 a.b.c 点路径;顶层键必须在默认配置白名单内,并拦截原型污染键
   if (typeof key !== 'string' || !key) return { ok: false, error: '无效的配置键' };
   const parts = key.split('.');
   if (parts.some(x => FORBIDDEN_KEYS.has(x))) return { ok: false, error: '非法配置键' };
   if (!CONFIG_TOP_KEYS.has(parts[0])) return { ok: false, error: '不允许的配置键: ' + parts[0] };
   // 复合键旁路防护:save-service / save-preset 已各自校验元素,但 save-config 能直接
-  // 写 services / promptPresets 整键或 services.N.apiBase 这类点路径,绕过那些校验。
-  // 这里对流经 save-config 的复合值补一次元素级校验,保证两条写入路径强度一致。
+  // 写 services / promptPresets 整键或点路径,绕过那些校验。这里统一收口。
+  //
+  // 两个原则:
+  //   1. 断言函数返回的"清理后对象"必须真正用于落盘,否则清理形同虚设
+  //      (旧实现只调用 assertService/assertPreset 却丢弃返回值,__proto__ 修剪等不生效);
+  //   2. 点路径必须逐字段校验,不能只护住 apiBase,也不能让任意字段自由通过。
+  let value = val;
+  // 若走的是"数组元素整体替换"或"数组元素单字段修改",需要把索引改成数字,
+  // 否则 patch 里会用字符串键 "0" 拼出对象而不是数组下标。
+  let arrayIndex = null;
   try {
     const top = parts[0];
-    if (top === 'services') {
-      if (Array.isArray(val)) {
-        // 整键替换:每个元素都必须过 assertService
-        val.forEach(x => assertService(x));
-      } else if (parts.length === 3 && parts[2] === 'apiBase') {
-        // 点路径改单个字段:只校验该字段,不要求整对象齐全(否则正常的单字段编辑会被误拦)
-        assertApiBase(val);
+    if (top === 'services' || top === 'promptPresets') {
+      const isSvc = top === 'services';
+      const assertFull = isSvc ? assertService : assertPreset;
+      const assertField = isSvc ? assertServiceField : assertPresetField;
+      const label = isSvc ? '服务' : '预设';
+
+      if (parts.length === 1) {
+        // 整键替换:用清理后的对象组数
+        if (!Array.isArray(val)) throw new Error(top + ' 必须是数组');
+        value = val.map(x => assertFull(x));
+      } else if (parts.length === 2) {
+        // <top>.<index> 整体替换:下标必须合法且目标已存在
+        const current = await loadConfig();
+        arrayIndex = assertArrayIndex(parts[1], top, current[top]);
+        value = assertFull(val);
+      } else if (parts.length === 3) {
+        // <top>.<index>.<field>:下标 + 字段双重校验
+        const current = await loadConfig();
+        arrayIndex = assertArrayIndex(parts[1], top, current[top]);
+        value = assertField(parts[2], val);
+      } else {
+        throw new Error('不支持的' + label + '点路径: ' + key);
       }
-    } else if (top === 'promptPresets' && Array.isArray(val)) {
-      val.forEach(x => assertPreset(x));
     }
   } catch (err) {
     return argFail(err);
   }
+  // 构造 patch:数组元素路径要把索引段转成数字,
+  // 否则会拼出 {"services":{"0":{...}}} 这种对象,与配置里的数组结构不符。
   const patch = {}; let cur = patch;
-  parts.forEach((p, i) => { if (i === parts.length - 1) cur[p] = val; else cur = cur[p] = {}; });
-  return saveConfig(patch);
+  for (let i = 0; i < parts.length; i++) {
+    const isLast = i === parts.length - 1;
+    // 索引段出现在 i===1 且 arrayIndex 已解析时,用数字键
+    const seg = (i === 1 && arrayIndex !== null) ? arrayIndex : parts[i];
+    if (isLast) cur[seg] = value;
+    else cur = cur[seg] = {};
+  }
+  // 落盘可能因"原配置损坏/不可读"而中止(见 config-service 的 loadConfigStrict)。
+  // 必须把它转成契约结构返回,不能让异常穿透 IPC —— 否则渲染层拿到的是 rejected Promise,
+  // 既没有 error 文案也没有 code,用户只看到操作没反应。
+  try {
+    return await saveConfig(patch);
+  } catch (err) {
+    // 配置损坏(E_CONFIG_PARSE)是"文件状态不允许写入",归 E_STATE;
+    // 读取失败(E_CONFIG_READ 及权限/磁盘类)归 E_IO。
+    const code = (err && err.code === 'E_CONFIG_PARSE') ? ERROR_CODES.E_STATE : ERROR_CODES.E_IO;
+    return failFrom(err, code, { configAborted: true });
+  }
 });
 // reason 只允许枚举内的值:它是 changeWallpaper() 的分支判据,任意字符串会流入流程与日志
 ipcMain.handle('change-wallpaper', (e, reason) => {
@@ -787,7 +810,7 @@ ipcMain.handle('use-history', async (e, name) => {
 ipcMain.handle('get-status', async () => {
   const cfg = await loadConfig();
   let nextRun = null;
-  if (cfg.schedule.enabled && scheduleTimer) {
+  if (cfg.schedule.enabled && scheduler.isRunning()) {
     nextRun = new Date(Date.now() + cfg.schedule.intervalMinutes * 60000).toLocaleTimeString('zh-CN', { hour12: false });
   }
   let currentPathStr = null;
@@ -819,18 +842,31 @@ ipcMain.handle('get-status', async () => {
     oldTaskRunning: !(cfg.migrate && cfg.migrate.oldTaskDisabled),
   };
 });
-ipcMain.handle('get-autorun', () => app.getLoginItemSettings().openAtLogin);
-ipcMain.handle('set-autorun', (e, on) => { app.setLoginItemSettings({ openAtLogin: !!on }); return app.getLoginItemSettings().openAtLogin; });
+// 读取开机自启状态:系统调用失败时返回 false(安全默认值 = 视为未开启),
+// 不把异常抛给渲染层,避免设置页因一个读取失败而整体不可用。
+ipcMain.handle('get-autorun', () => {
+  try { return !!app.getLoginItemSettings().openAtLogin; } catch { return false; }
+});
+// 严格布尔:不接受 "false"/1/"true" 这类隐式转换,否则开机自启会被字符串误置
+ipcMain.handle('set-autorun', (e, on) => {
+  let v;
+  try { v = assertBool(on, '开机自启开关'); } catch (err) { return argFail(err); }
+  app.setLoginItemSettings({ openAtLogin: v });
+  return app.getLoginItemSettings().openAtLogin;
+});
 ipcMain.handle('open-wallpaper-dir', () => { ensureDir(); shell.openPath(wallDir()); });
 ipcMain.handle('add-tag', async (e, tag) => {
+  let t;
+  try { t = assertTag(tag); } catch (err) { return argFail(err); }
   const cfg = await loadConfig();
-  const t = String(tag).trim();
-  if (t && !cfg.lolicon.tags.includes(t)) await saveConfig({ lolicon: { tags: [...cfg.lolicon.tags, t] } });
+  if (!cfg.lolicon.tags.includes(t)) await saveConfig({ lolicon: { tags: [...cfg.lolicon.tags, t] } });
   return true;
 });
 ipcMain.handle('remove-tag', async (e, tag) => {
+  let t;
+  try { t = assertTag(tag); } catch (err) { return argFail(err); }
   const cfg = await loadConfig();
-  await saveConfig({ lolicon: { tags: cfg.lolicon.tags.filter(t => t !== tag) } });
+  await saveConfig({ lolicon: { tags: cfg.lolicon.tags.filter(x => x !== t) } });
   return true;
 });
 ipcMain.handle('disable-old-task', () => disableOldTask());
@@ -975,12 +1011,17 @@ ipcMain.handle('fetch-models', async (e, rawSvc) => {
 // 有文本服务:调 chat/completions 生成 Danbooru 标签串;无:本地风格词池随机增强
 // 随机生成一条提示词(供 AI 页「摇一摇」预览)
 ipcMain.handle('roll-random-prompt', async (e, mode) => {
-  return { prompt: buildRandomPrompt(mode || 'any') };
+  // mode 走枚举白名单,不允许任意字符串直通 buildRandomPrompt;缺省 any
+  let m;
+  try { m = assertRandomMode(mode); } catch (err) { return argFail(err); }
+  return { prompt: buildRandomPrompt(m) };
 });
 ipcMain.handle('ai-assist-prompt', async (e, userTheme) => {
+  // 主题会整段拼进系统提示词,必须先限长,避免超长内容直通远端模型
+  let theme;
+  try { theme = assertTheme(userTheme); } catch (err) { return argFail(err); }
   const cfg = await loadConfig();
   const tags = (cfg.lolicon.tags || []).join(', ');
-  const theme = String(userTheme || '').trim();
   const textSvc = findService(cfg, cfg.activeTextService);
   if (!textSvc) {
     // 本地兜底:主题词 + 标签池元素 + 随机风格增强
@@ -1061,10 +1102,27 @@ ipcMain.handle('list-favorites', async () => {
   } catch { return []; }
 });
 ipcMain.handle('delete-favorite', async (e, name) => {
+  // basename 只能挡路径穿越,不能替代参数校验:
+  // favorites 目录里可能还有别的文件,不加白名单就可能被删掉。
+  // 这里按 favorite-current 的真实命名规则 fav_yyyyMMdd_HHmmss.jpg 做白名单校验。
+  let safe;
+  try { safe = assertFavoriteName(name); } catch (err) { return argFail(err); }
+  const favDir = path.join(wallDir(), 'favorites');
+  const target = path.join(favDir, safe);
+  // 双保险:确认最终路径确实落在 favorites 目录内(文件名已白名单化,此处防御未来改动)
+  if (path.dirname(path.resolve(target)) !== path.resolve(favDir)) {
+    return fail('收藏文件路径不合法', ERROR_CODES.E_INVALID_ARG);
+  }
   try {
-    await fsp.unlink(path.join(wallDir(), 'favorites', path.basename(name)));
+    if (!fs.existsSync(target)) {
+      return fail('收藏文件不存在: ' + safe, ERROR_CODES.E_NOT_FOUND);
+    }
+    markSelfWrite();
+    await fsp.unlink(target);
     return { ok: true };
-  } catch (err) { return { ok: false, error: err.message }; }
+  } catch (err) {
+    return failFrom(err, ERROR_CODES.E_IO);
+  }
 });
 
 // ---------- 元数据 ----------
@@ -1146,4 +1204,4 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 app.on('window-all-closed', () => { /* 保持托盘运行,不退出 */ });
-app.on('before-quit', () => { if (scheduleTimer) clearInterval(scheduleTimer); });
+app.on('before-quit', () => { scheduler.stop(); });

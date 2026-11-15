@@ -98,7 +98,9 @@ function stepInterval(d) {
   saveNum('schedule.intervalMinutes', el.value);
 }
 async function saveGameProcs(txt) {
-  await api.saveConfig('gameCheck.processes', txt.split('\n').map(s => s.trim()).filter(Boolean));
+  // 落盘失败必须让用户看见:原实现丢弃返回值,失败也提示"已保存"
+  const r = await api.saveConfig('gameCheck.processes', txt.split('\n').map(s => s.trim()).filter(Boolean));
+  if (r && r.ok === false) { toast('保存失败: ' + (r.error || '未知错误'), 4000); return; }
   toast('已保存');
 }
 async function disableOldTask() {
@@ -108,7 +110,20 @@ async function disableOldTask() {
 }
 async function toggleAutoRun(el) {
   el.classList.toggle('on');
-  await api.setAutoRun(el.classList.contains('on'));
+  const want = el.classList.contains('on');
+  // setAutoRun 现在会拒绝非布尔入参,也可能因系统调用失败返回 ok:false;
+  // 两种情况下都不能让界面停在"看起来开启/关闭成功"的假状态,必须拨回原状。
+  const r = await api.setAutoRun(want);
+  const applied = (r && typeof r === 'object' && r.ok === false) ? null : r;
+  if (applied === null) {
+    el.classList.toggle('on', !want);
+    toast('设置失败: ' + (r.error || '未知错误'), 4000);
+    return;
+  }
+  // setAutoRun 成功时返回系统实际状态(bool);以系统返回值为准纠正界面
+  if (typeof applied === 'boolean' && applied !== want) {
+    el.classList.toggle('on', applied);
+  }
   toast(el.classList.contains('on') ? '已开启开机自启' : '已关闭开机自启');
 }
 
@@ -138,13 +153,26 @@ function renderTags(tags) {
 async function addTag() {
   const v = $('tag-input').value.trim();
   if (!v) return;
-  await api.addTag(v);
+  // 保存失败时保留输入框内容,方便用户重试;只有成功才清空并刷新列表
+  try {
+    const r = await api.addTag(v);
+    if (r && r.ok === false) { toast('添加标签失败: ' + (r.error || '未知错误'), 4000); return; }
+  } catch (e) {
+    toast('添加标签失败: ' + ((e && e.message) || '通信异常'), 4000);
+    return;
+  }
   $('tag-input').value = '';
-  renderTags((await api.getConfig()).lolicon.tags);
+  try { renderTags((await api.getConfig()).lolicon.tags); } catch {}
 }
 async function delTag(t) {
-  await api.removeTag(t);
-  renderTags((await api.getConfig()).lolicon.tags);
+  try {
+    const r = await api.removeTag(t);
+    if (r && r.ok === false) { toast('删除标签失败: ' + (r.error || '未知错误'), 4000); return; }
+  } catch (e) {
+    toast('删除标签失败: ' + ((e && e.message) || '通信异常'), 4000);
+    return;
+  }
+  try { renderTags((await api.getConfig()).lolicon.tags); } catch {}
 }
 
 // ---------- 动作 ----------
@@ -205,18 +233,36 @@ async function loadPresets() {
   box.appendChild(makeSlot('存当前为新预设', '#i-plus', () => saveAsPreset(), true));
 }
 async function applyPreset(id) {
-  const cfg = await api.getConfig();
-  const p = (cfg.promptPresets || []).find(x => x.id === id);
+  let p;
+  try {
+    const cfg = await api.getConfig();
+    p = (cfg.promptPresets || []).find(x => x.id === id);
+  } catch (e) {
+    toast('套用预设失败: ' + ((e && e.message) || '读取配置异常'), 4000);
+    return;
+  }
   if (!p) return;
+  // 先保存成功再改界面与提示,避免"界面变了但配置没落盘"
+  try {
+    const r = await api.saveConfig('ai.prompt', p.prompt);
+    if (r && r.ok === false) { toast('套用预设失败: ' + (r.error || '未知错误'), 4000); return; }
+  } catch (e) {
+    toast('套用预设失败: ' + ((e && e.message) || '通信异常'), 4000);
+    return;
+  }
   $('ai-prompt').value = p.prompt;
-  await api.saveConfig('ai.prompt', p.prompt);
   toast('已套用预设: ' + p.name);
 }
 async function saveAsPreset() {
   const name = prompt('预设名称:', '新预设');
   if (!name) return;
-  const r = await api.savePreset({ id: 'preset-' + Date.now(), name, prompt: $('ai-prompt').value });
-  if (!r || r.ok === false) { toast('预设保存失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  try {
+    const r = await api.savePreset({ id: 'preset-' + Date.now(), name, prompt: $('ai-prompt').value });
+    if (!r || r.ok === false) { toast('预设保存失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  } catch (e) {
+    toast('预设保存失败: ' + ((e && e.message) || '通信异常'), 4000);
+    return;
+  }
   loadPresets();
   toast('预设已保存');
 }
@@ -431,22 +477,38 @@ async function saveService() {
   editingSvc.apiKey = $('svc-key').value.trim();
   editingSvc.model = $('svc-model').value.trim();
   if (!editingSvc.apiBase) { toast('API 地址不能为空'); return; }
-  const r = await api.saveService(editingSvc);
-  if (!r || r.ok === false) { toast('保存失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  // 失败时保留编辑器打开状态与全部输入,只有真正保存成功才关闭并刷新
+  try {
+    const r = await api.saveService(editingSvc);
+    if (!r || r.ok === false) { toast('保存失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  } catch (e) {
+    toast('保存失败: ' + ((e && e.message) || '通信异常'), 4000);
+    return;
+  }
   closeEditor();
   loadServices();
   toast('服务已保存');
 }
 async function deleteService(id) {
   if (!confirm('确定删除该服务?')) return;
-  const r = await api.deleteService(id);
-  if (!r || r.ok === false) { toast('删除失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  try {
+    const r = await api.deleteService(id);
+    if (!r || r.ok === false) { toast('删除失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  } catch (e) {
+    toast('删除失败: ' + ((e && e.message) || '通信异常'), 4000);
+    return;
+  }
   loadServices();
   toast('已删除');
 }
 async function setActive(kind, id) {
-  const r = await api.setActiveService(kind, id);
-  if (!r || r.ok === false) { toast('切换失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  try {
+    const r = await api.setActiveService(kind, id);
+    if (!r || r.ok === false) { toast('切换失败: ' + ((r && r.error) || '未知错误'), 4000); return; }
+  } catch (e) {
+    toast('切换失败: ' + ((e && e.message) || '通信异常'), 4000);
+    return;
+  }
   loadServices();
   toast(kind === 'image' ? '已设为画图服务' : '已设为提示词助手引擎');
 }

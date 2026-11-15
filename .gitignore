@@ -16,3 +16,6 @@ builder_log*.txt
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 测试运行时产物(每次执行 run-all.js 都会重写,不入库)
+tests/last-run.json
