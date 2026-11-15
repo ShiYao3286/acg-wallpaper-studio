@@ -9,8 +9,27 @@
 //      只能通过 ctx 注入的能力(netFetch / config)做事 —— 这是权限边界的基础。
 //   2. 协议校验全部是"纯函数 + 抛 ArgError",不产生副作用,便于单测。
 //   3. 内置 Provider 与未来外部插件走同一套校验,不存在"内部信任"的后门。
+//   4. (阶段3)可选 auth 字段描述"该 Provider 是否需要账号登录",但:
+//      - 未填写时行为与阶段2完全一致(字段为 null),不破坏任何既有 Provider;
+//      - 认证声明【不是】权限隔离,也不是凭据容器;
+//      - 真正的 Cookie 由 services/credential-service 独占,绝不进 ctx 或 IPC。
 
 const { fail, ERROR_CODES } = require('../../shared/contracts');
+// 阶段3:可选认证描述。注意 provider-protocol 不能反过来被 auth-protocol 依赖,
+// 依赖方向固定为 provider-protocol -> auth-protocol(单向)。
+const { assertAuth, isAuthProtocolError } = require('./auth/auth-protocol');
+
+// auth 校验抛的是 AuthProtocolError,但本模块对外统一用 ProtocolError ——
+// 否则调用方 isProtocolError(err) 会返回 false,误判成"不是协议问题",
+// 把配置错误当成运行时故障处理。这里做一次归一化。
+function describeAuth(raw) {
+  try {
+    return assertAuth(raw);
+  } catch (e) {
+    if (isAuthProtocolError(e)) bad(e.message);
+    throw e;
+  }
+}
 
 // Provider 类型白名单。
 //   image-source: 随机图源(如 Lolicon),不需要用户 API Key
@@ -117,6 +136,10 @@ function describeProvider(raw) {
     capabilities: assertCapabilities(raw.capabilities === undefined ? [] : raw.capabilities, kind),
     configSchema: assertConfigSchema(raw.configSchema),
     builtin: raw.builtin === true,
+    // 阶段3:可选认证描述。未填写时为 null,表示"该 Provider 无需账号登录"。
+    // 老 Provider 不填此字段,describeProvider 返回值只多一个 null 属性,
+    // 行为与之前完全一致(见下方 auth 兼容性说明)。
+    auth: describeAuth(raw.auth),
   };
 
   // 每种 kind 对应一个必须实现的方法
