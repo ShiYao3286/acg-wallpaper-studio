@@ -3,6 +3,15 @@
 <head>
 <meta charset="UTF-8">
 <title>ACG壁纸工作室</title>
+<!-- 内容安全策略(阶段2)
+     设计依据(动手前核实过):
+       - 脚本:仅 renderer.js 一个外链文件,无内联 <script>,故 script-src 'self'
+       - 样式:有 1 个内联 <style> 且 renderer.js 有动态 el.style 操作,
+               'unsafe-inline' 在 style-src 上属必要;它只允许写样式,不构成脚本执行面
+       - 图片:预览图用 file:// 加载本地壁纸文件,故放开 img-src file:
+       - 网络:renderer 不做任何 fetch/XHR/WebSocket(全部走 IPC),故 connect-src 'none'
+       - 框架/插件/表单:一律不支持,显式写 none 而非留空 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' file: data:; font-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
 <style>
 :root {
   --bg0:#0e0c1a; --bg1:#1a1530;
@@ -202,8 +211,8 @@ textarea { resize:vertical; }
   <!-- 版本号需与 package.json 保持一致，后续应由主进程注入 -->
   <div class="tb-brand"><img src="../../assets/icon.png"><b>ACG壁纸工作室</b>&nbsp;v1.3.1</div>
   <div class="tb-btns">
-    <button onclick="api.win.minimize()"><svg><use href="#i-min"/></svg></button>
-    <button class="close" onclick="api.win.close()"><svg><use href="#i-x"/></svg></button>
+    <button data-act="win-minimize"><svg><use href="#i-min"/></svg></button>
+    <button class="close" data-act="win-close"><svg><use href="#i-x"/></svg></button>
   </div>
 </div>
 
@@ -230,7 +239,7 @@ textarea { resize:vertical; }
         <div class="hero-card">
           <img id="preview" src="">
           <div class="hero-actions">
-            <button class="icon-btn" title="收藏当前壁纸" onclick="favCurrent()"><svg><use href="#i-heart"/></svg></button>
+            <button class="icon-btn" title="收藏当前壁纸" data-act="fav-current"><svg><use href="#i-heart"/></svg></button>
           </div>
           <div class="hero-overlay">
             <div class="hero-title" id="hero-title">还没有换过图</div>
@@ -241,27 +250,27 @@ textarea { resize:vertical; }
         <div class="side-col">
           <div class="card">
             <div style="font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:7px"><svg style="width:15px;height:15px"><use href="#i-zap"/></svg>快速设置</div>
-            <div class="field"><span>自动换图</span><div class="switch on" id="sw-schedule" onclick="toggleSwitch(this,'schedule.enabled')"></div></div>
+            <div class="field"><span>自动换图</span><div class="switch on" id="sw-schedule" data-act="toggle" data-key="schedule.enabled"></div></div>
             <div class="field"><span>间隔(分钟)</span>
               <div class="stepper">
-                <button onclick="stepInterval(-5)">−</button>
-                <input type="number" id="interval" min="5" max="720" onchange="saveNum('schedule.intervalMinutes',this.value)">
-                <button onclick="stepInterval(5)">+</button>
+                <button data-act="step-interval" data-delta="-5">−</button>
+                <input type="number" id="interval" min="5" max="720" data-set="num" data-key="schedule.intervalMinutes">
+                <button data-act="step-interval" data-delta="5">+</button>
               </div>
             </div>
-            <div class="field"><span>游戏时暂停</span><div class="switch on" id="sw-game" onclick="toggleSwitch(this,'gameCheck.enabled')"></div></div>
+            <div class="field"><span>游戏时暂停</span><div class="switch on" id="sw-game" data-act="toggle" data-key="gameCheck.enabled"></div></div>
           </div>
           <div class="card">
             <div style="font-weight:600;margin-bottom:8px">壁纸来源</div>
             <div class="seg" id="source-seg">
-              <button id="seg-lolicon" class="on" onclick="setSource('lolicon')">二次元图</button>
-              <button id="seg-ai" onclick="setSource('ai')">AI 生图</button>
+              <button id="seg-lolicon" class="on" data-act="set-source" data-src="lolicon">二次元图</button>
+              <button id="seg-ai" data-act="set-source" data-src="ai">AI 生图</button>
             </div>
             <p class="hint" style="margin-top:8px">定时换图使用此来源;也可单独点下方按钮。</p>
           </div>
           <div class="btn-col">
-            <button class="btn" id="btn-change" onclick="changeNow()"><svg><use href="#i-refresh"/></svg>立即换一张</button>
-            <button class="btn ghost" onclick="openFolder()"><svg><use href="#i-folder"/></svg>打开壁纸文件夹</button>
+            <button class="btn" id="btn-change" data-act="change-now"><svg><use href="#i-refresh"/></svg>立即换一张</button>
+            <button class="btn ghost" data-act="open-folder"><svg><use href="#i-folder"/></svg>打开壁纸文件夹</button>
           </div>
         </div>
       </div>
@@ -274,18 +283,18 @@ textarea { resize:vertical; }
         <div id="tag-list" style="margin-top:10px"></div>
         <div class="row" style="margin-top:12px">
           <input type="text" id="tag-input" placeholder="输入 Pixiv 标签,如:Arknights" style="width:230px" onkeydown="if(event.key==='Enter')addTag()">
-          <button class="btn small" onclick="addTag()"><svg><use href="#i-plus"/></svg>添加</button>
+          <button class="btn small" data-act="add-tag"><svg><use href="#i-plus"/></svg>添加</button>
         </div>
       </div>
       <div class="card">
         <div class="field"><span>图片尺寸</span>
-          <select id="lolicon-size" onchange="saveStr('lolicon.size',this.value)">
+          <select id="lolicon-size" data-set="str" data-key="lolicon.size">
             <option value="regular">常规 (约1200px,推荐)</option>
             <option value="original">原图 (最高清,较慢)</option>
           </select></div>
-        <div class="field"><span>排除 AI 图</span><div class="switch on" id="sw-excludeai" onclick="toggleSwitch(this,'lolicon.excludeAI')"></div></div>
+        <div class="field"><span>排除 AI 图</span><div class="switch on" id="sw-excludeai" data-act="toggle" data-key="lolicon.excludeAI"></div></div>
         <div class="field"><span>R18 内容</span>
-          <select id="lolicon-r18" onchange="saveNum('lolicon.r18',parseInt(this.value))">
+          <select id="lolicon-r18" data-set="num" data-key="lolicon.r18">
             <option value="0">关闭</option>
             <option value="1">仅 R18</option>
             <option value="2">混合</option>
@@ -297,16 +306,16 @@ textarea { resize:vertical; }
       <h2><svg><use href="#i-bot"/></svg>AI 生图壁纸</h2>
       <div class="card">
         <div class="mode-grid">
-          <div class="mode-card on" id="mode-any" onclick="setRandomMode('any')">
+          <div class="mode-card on" id="mode-any" data-act="set-mode" data-mode="any">
             <svg><use href="#i-sparkle"/></svg><b>完全随机</b><span>人物 / 风景随机出</span>
           </div>
-          <div class="mode-card" id="mode-portrait" onclick="setRandomMode('portrait')">
+          <div class="mode-card" id="mode-portrait" data-act="set-mode" data-mode="portrait">
             <svg><use href="#i-heart"/></svg><b>锁定人物</b><span>发色服装场景随机</span>
           </div>
-          <div class="mode-card" id="mode-scenery" onclick="setRandomMode('scenery')">
+          <div class="mode-card" id="mode-scenery" data-act="set-mode" data-mode="scenery">
             <svg><use href="#i-img"/></svg><b>锁定风景</b><span>山水天气纯壁纸</span>
           </div>
-          <div class="mode-card" id="mode-custom" onclick="setRandomMode('custom')">
+          <div class="mode-card" id="mode-custom" data-act="set-mode" data-mode="custom">
             <svg><use href="#i-wand"/></svg><b>自定义</b><span>手写提示词</span>
           </div>
         </div>
@@ -314,12 +323,12 @@ textarea { resize:vertical; }
         <div id="random-preview-area" style="margin-top:10px">
           <div class="prompt-box">
             <code id="random-prompt-preview">…</code>
-            <button class="reroll" title="换一条" onclick="rollPreview(this)"><svg><use href="#i-refresh"/></svg></button>
+            <button class="reroll" title="换一条" data-act="roll-preview"><svg><use href="#i-refresh"/></svg></button>
           </div>
         </div>
         <div id="custom-prompt-area" style="display:none">
           <div class="field" style="margin-top:12px"><span>生图提示词</span></div>
-          <textarea id="ai-prompt" style="width:100%;min-height:84px" onchange="saveStr('ai.prompt',this.value)"></textarea>
+          <textarea id="ai-prompt" style="width:100%;min-height:84px" data-set="str" data-key="ai.prompt"></textarea>
           <div style="margin-top:12px">
             <div style="font-weight:600;margin-bottom:6px;font-size:13px">提示词预设槽</div>
             <div id="preset-list" style="display:flex;flex-wrap:wrap;gap:8px"></div>
@@ -332,7 +341,7 @@ textarea { resize:vertical; }
             </div>
             <div class="row" style="margin:0">
               <input type="text" id="assist-theme" placeholder="主题,如:雪地里的初音未来 / 星空下的古城" style="flex:1" onkeydown="if(event.key==='Enter')runAssist()">
-              <button class="btn small" id="btn-assist" onclick="runAssist()"><svg><use href="#i-sparkle"/></svg>生成提示词</button>
+              <button class="btn small" id="btn-assist" data-act="run-assist"><svg><use href="#i-sparkle"/></svg>生成提示词</button>
             </div>
           </div>
         </div>
@@ -340,15 +349,15 @@ textarea { resize:vertical; }
       <div class="card">
         <div class="row" style="margin:0">
           <span style="color:var(--sub);font-size:13px">模型</span>
-          <select id="ai-model" onchange="saveStr('ai.model',this.value)">
+          <select id="ai-model" data-set="str" data-key="ai.model">
             <option>gpt-image-2</option><option>gpt-image-2.5-flare</option>
             <option>gpt-image-2.5-sunburst</option><option>gpt-image-2.6</option>
           </select>
           <span style="color:var(--sub);font-size:13px">尺寸</span>
-          <select id="ai-size" onchange="saveStr('ai.size',this.value)">
+          <select id="ai-size" data-set="str" data-key="ai.size">
             <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
           </select>
-          <button class="btn" id="btn-ai" style="margin-left:auto" onclick="aiNow()"><svg><use href="#i-sparkle"/></svg>用 AI 生成壁纸</button>
+          <button class="btn" id="btn-ai" style="margin-left:auto" data-act="ai-now"><svg><use href="#i-sparkle"/></svg>用 AI 生成壁纸</button>
         </div>
         <p class="hint" style="margin-top:8px">生成约需 20~60 秒,生成完成自动设为壁纸并写入历史。</p>
       </div>
@@ -370,7 +379,7 @@ textarea { resize:vertical; }
         <p class="hint">预设多个 OpenAI 兼容 API(画图 / 文本)。画图服务用于 AI 壁纸;文本服务驱动「提示词助手」结合标签池写提示词。支持拉取模型列表与连通测试。</p>
         <div id="svc-list" style="margin-top:12px"></div>
         <div class="row" style="margin-top:12px">
-          <button class="btn small" onclick="newService()"><svg><use href="#i-plus"/></svg>添加服务</button>
+          <button class="btn small" data-act="new-service"><svg><use href="#i-plus"/></svg>添加服务</button>
         </div>
       </div>
       <div class="card" id="svc-editor" style="display:none">
@@ -382,13 +391,13 @@ textarea { resize:vertical; }
         <div class="field"><span>API Key</span><input type="password" id="svc-key" style="flex:1"></div>
         <div class="field"><span>默认模型</span>
           <input type="text" id="svc-model" style="flex:1" list="svc-model-list" placeholder="可手动输入,或点右侧拉取">
-          <button class="btn small ghost" id="btn-fetch-models" onclick="fetchModels()"><svg><use href="#i-refresh"/></svg>拉取模型</button></div>
+          <button class="btn small ghost" id="btn-fetch-models" data-act="fetch-models"><svg><use href="#i-refresh"/></svg>拉取模型</button></div>
         <datalist id="svc-model-list"></datalist>
         <div class="svc-test-result" id="svc-editor-result"></div>
         <div class="row" style="margin-top:10px">
-          <button class="btn small" onclick="saveService()"><svg><use href="#i-check"/></svg>保存</button>
-          <button class="btn small ghost" onclick="testEditing()"><svg><use href="#i-zap"/></svg>测试连通</button>
-          <button class="btn small ghost" onclick="closeEditor()">取消</button>
+          <button class="btn small" data-act="save-service"><svg><use href="#i-check"/></svg>保存</button>
+          <button class="btn small ghost" data-act="test-editing"><svg><use href="#i-zap"/></svg>测试连通</button>
+          <button class="btn small ghost" data-act="close-editor">取消</button>
         </div>
       </div>
     </div>
@@ -396,22 +405,22 @@ textarea { resize:vertical; }
     <div class="page" id="page-settings">
       <h2><svg><use href="#i-gear"/></svg>设置</h2>
       <div class="card">
-        <div class="field"><span>开机自动启动</span><div class="switch" id="sw-autorun" onclick="toggleAutoRun(this)"></div></div>
-        <div class="field"><span>历史保留数量</span><input type="number" id="hist-keep" min="3" max="200" style="width:80px" onchange="saveNum('history.keepCount',this.value)"> <span style="color:var(--sub);font-size:12px">张</span></div>
+        <div class="field"><span>开机自动启动</span><div class="switch" id="sw-autorun" data-act="toggle-autorun"></div></div>
+        <div class="field"><span>历史保留数量</span><input type="number" id="hist-keep" min="3" max="200" style="width:80px" data-set="num" data-key="history.keepCount"> <span style="color:var(--sub);font-size:12px">张</span></div>
         <div class="field"><span>游戏进程名单</span></div>
-        <textarea id="game-procs" style="width:100%;min-height:64px" onchange="saveGameProcs(this.value)"></textarea>
+        <textarea id="game-procs" style="width:100%;min-height:64px" data-set="game-procs"></textarea>
         <p class="hint">每行一个进程名(不含 .exe),如 WardogsClient-Win64-Shipping</p>
       </div>
       <div class="card">
         <div style="font-weight:600;margin-bottom:4px">🌐 网络代理</div>
         <p class="hint">访问 Lolicon / AI API 走此代理(需代理软件的 HTTP 端口,如 Clash Verge 的 7897)。本机服务(127.0.0.1 网关)不受影响。</p>
-        <div class="field"><span>启用代理</span><div class="switch" id="sw-proxy" onclick="toggleSwitch(this,'proxy.enabled')"></div></div>
-        <div class="field"><span>代理地址</span><input type="text" id="proxy-url" style="flex:1" placeholder="http://127.0.0.1:7897" onchange="saveStr('proxy.url',this.value)">
-          <button class="btn small ghost" onclick="detectProxy()"><svg><use href="#i-refresh"/></svg>自动探测</button></div>
+        <div class="field"><span>启用代理</span><div class="switch" id="sw-proxy" data-act="toggle" data-key="proxy.enabled"></div></div>
+        <div class="field"><span>代理地址</span><input type="text" id="proxy-url" style="flex:1" placeholder="http://127.0.0.1:7897" data-set="str" data-key="proxy.url">
+          <button class="btn small ghost" data-act="detect-proxy"><svg><use href="#i-refresh"/></svg>自动探测</button></div>
         <div class="svc-test-result" id="proxy-detect-result"></div>
       </div>
       <div class="card">
-        <div class="field"><span>旧计划任务</span><button class="btn danger small" onclick="disableOldTask()">停用 ACG-Wallpaper-Auto</button>
+        <div class="field"><span>旧计划任务</span><button class="btn danger small" data-act="disable-old-task">停用 ACG-Wallpaper-Auto</button>
           <span class="hint" id="old-task-status"></span></div>
         <p class="hint">本软件自带定时换图,旧计划任务需停用,避免双重换图冲突。</p>
       </div>

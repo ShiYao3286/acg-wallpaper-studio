@@ -16,6 +16,71 @@ document.querySelectorAll('.nav-item').forEach(el => {
   });
 });
 
+// ---------- 事件委托(阶段2:替代内联 onclick/onchange,以便启用 CSP) ----------
+// 原先 index.html 里有 38 处内联事件(29 onclick + 9 onchange),内联处理器无法与
+// script-src 'self' 共存。这里统一改为 data-act / data-set 声明 + 单点委托。
+// 用映射表而不是 eval/new Function:既不引入动态代码执行,也让 "有哪些动作" 一目了然。
+//
+// data-act="...":点击类动作,可带 data-key / data-src / data-mode / data-delta
+// data-set="str|num":change 类动作,直接写配置项
+// 注意:data-set="game-procs" 是特例(需要传整个文本框值给 saveGameProcs)
+
+const CLICK_ACTIONS = {
+  'win-minimize': () => api.win.minimize(),
+  'win-close': () => api.win.close(),
+  'fav-current': () => favCurrent(),
+  'change-now': () => changeNow(),
+  'open-folder': () => openFolder(),
+  'add-tag': () => addTag(),
+  'run-assist': () => runAssist(),
+  'ai-now': () => aiNow(),
+  'new-service': () => newService(),
+  'fetch-models': () => fetchModels(),
+  'save-service': () => saveService(),
+  'test-editing': () => testEditing(),
+  'close-editor': () => closeEditor(),
+  'detect-proxy': () => detectProxy(),
+  'disable-old-task': () => disableOldTask(),
+  'toggle': (el) => toggleSwitch(el, el.dataset.key),
+  'toggle-autorun': (el) => toggleAutoRun(el),
+  'set-source': (el) => setSource(el.dataset.src),
+  'set-mode': (el) => setRandomMode(el.dataset.mode),
+  'step-interval': (el) => stepInterval(Number(el.dataset.delta)),
+  'roll-preview': (el) => rollPreview(el),
+};
+
+// change 类:key 来自 data-key,值来自元素自身
+const CHANGE_SETTERS = {
+  str: (el) => saveStr(el.dataset.key, el.value),
+  num: (el) => saveNum(el.dataset.key, el.value),
+};
+
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('[data-act]');
+  if (!el) return;
+  const fn = CLICK_ACTIONS[el.dataset.act];
+  if (!fn) {
+    // 未知动作说明 HTML 与 JS 脱节,提示出来而不是静默失败
+    console.warn('未注册的 data-act:', el.dataset.act);
+    return;
+  }
+  fn(el);
+});
+
+document.addEventListener('change', (ev) => {
+  const el = ev.target.closest('[data-set]');
+  if (!el) return;
+  const kind = el.dataset.set;
+  // 特例:游戏进程列表需要整段文本,单独处理
+  if (kind === 'game-procs') { saveGameProcs(el.value); return; }
+  const fn = CHANGE_SETTERS[kind];
+  if (!fn) {
+    console.warn('未注册的 data-set:', kind);
+    return;
+  }
+  fn(el);
+});
+
 function toast(msg, ms = 2600) {
   const t = $('toast'); t.textContent = msg; t.style.display = 'block';
   clearTimeout(t._tm); t._tm = setTimeout(() => t.style.display = 'none', ms);
