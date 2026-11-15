@@ -159,6 +159,117 @@ function mkSafe(o) {
     await am.cancelLogin();
   }
 
+  // E 组 —— 阶段3 审核修复:URL 合法性与域名白名单
+  // 对应问题:文档里的地址一度被写成 Markdown 链接 [x](x),
+  // 以及 main.js 与 auth-protocol.js 各自重复定义一份 URL。
+  // ==========================================================================
+  group('E URL 合法性与域名白名单');
+  {
+    const V = ap.validateUrlConstants();
+    ok('E1', 'URL 常量整体自检通过', V.ok === true && V.errors.length === 0, V.errors.join(' | '));
+
+    // 逐条确认能被 new URL() 解析 + 协议是 https: + 域名在白名单内
+    const allUrls = [ap.LOGIN_URL, ...ap.ALLOWED_COOKIE_URLS];
+    ok('E2', '每个 URL 都能被 new URL() 解析', allUrls.every(u => {
+      try { new URL(u); return true; } catch { return false; }
+    }), allUrls.length + ' 条');
+
+    ok('E3', '每个 URL 的协议都是 https:', allUrls.every(u => new URL(u).protocol === 'https:'),
+      allUrls.map(u => new URL(u).protocol).join(','));
+
+    ok('E4', '每个 URL 的 hostname 都在白名单内',
+      allUrls.every(u => ap.ALLOWED_HOSTS.includes(new URL(u).hostname)),
+      allUrls.map(u => new URL(u).hostname).join(','));
+
+    ok('E5', 'URL 中不含 Markdown 链接语法',
+      allUrls.every(u => !/\]\s*\(|\[[^\]]*\]\s*\(/.test(u) && !/https?:\/\/[^\s]*\)/.test(u)),
+      allUrls.join(' | '));
+
+    // assertPureHttpsUrl 必须真的拦得住各种畸形输入
+    const rejects = [
+      ['https://www.doubao.com/](https://www.doubao.com/)', 'Markdown 链接形态'],
+      ['[https://www.doubao.com/](https://www.doubao.com/)', '方括号包裹的链接'],
+      ['http://www.doubao.com/', '非 https 协议'],
+      ['ftp://www.doubao.com/', 'ftp 协议'],
+      ['www.doubao.com', '缺少协议'],
+      ['', '空字符串'],
+      ['https://www.doubao.com/ chat/', '含空白'],
+      ['https://evil.test/', '域名不在白名单'],
+      ['https://evil-doubao.com/', '相似恶意域名'],
+    ];
+    ok('E6', 'assertPureHttpsUrl 逐一拒绝畸形输入', rejects.every(([badUrl]) => {
+      try { ap.assertPureHttpsUrl(badUrl, 'test'); return false; } catch (e) { return e && e.isAuthProtocolError === true; }
+    }), rejects.length + ' 个反向用例');
+
+    ok('E7', '合法 URL 通过 assertPureHttpsUrl', (() => {
+      try {
+        const u = ap.assertPureHttpsUrl('https://passport.doubao.com/x', 'test');
+        return u && u.hostname === 'passport.doubao.com';
+      } catch { return false; }
+    })());
+
+    // main.js 必须引用同一份常量,不能自己再写一遍
+    const mainSrc = fs.readFileSync(path.join(ROOT, 'src', 'main', 'main.js'), 'utf8');
+    ok('E8', 'main.js 不再重复定义豆包 URL 常量',
+      !/const\s+LOGIN_URL\s*=\s*'https:\/\/www\.doubao\.com/.test(mainSrc) &&
+      !/https:\/\/doubao\.com\/\\n/.test(mainSrc),
+      '未发现重复硬编码');
+    ok('E9', 'main.js 引用 authProtocol 的 URL 常量',
+      /authProtocol\.LOGIN_URL/.test(mainSrc) && /authProtocol\.ALLOWED_COOKIE_URLS/.test(mainSrc));
+    ok('E10', 'main.js 源码中无 Markdown 链接形态的 URL',
+      !/\]\(https?:\/\//.test(mainSrc));
+  }
+
+  // ==========================================================================
+  // F 组 —— 阶段3 审核修复:导航允许/拒绝
+  // 对应问题:旧正则只校验 hostname、不校验协议,http:// 会被放行。
+  // ==========================================================================
+  group('F 导航域名校验');
+  {
+    const allow = [
+      'https://doubao.com/',
+      'https://www.doubao.com/chat/',
+      'https://passport.doubao.com/login',
+      'https://www.doubao.com/chat/completion?aid=1',
+    ];
+    const deny = [
+      'http://www.doubao.com/',            // 非 https
+      'http://doubao.com/',
+      'https://evil-doubao.com/',          // 前缀伪装
+      'https://doubao.com.evil.test/',     // 后缀伪装
+      'https://notdoubao.com/',            // 缺分隔符
+      'https://doubao.com.evil.com/',      // 域名注入
+      'https://evil.test/',
+      'https://www.doubao.com.evil.test/', // 合法前缀 + 恶意后缀
+      'ftp://www.doubao.com/',
+      'javascript:alert(1)',
+      'file:///C:/Windows/System32/drivers/etc/hosts',
+      'not-a-url',
+      '',
+    ];
+    ok('F1', '合法豆包域名全部放行', allow.every(u => ap.isAllowedNavigateUrl(u) === true),
+      allow.filter(u => !ap.isAllowedNavigateUrl(u)).join(',') || '全通过');
+    ok('F2', '恶意/相似/非 https 域名全部拒绝', deny.every(u => ap.isAllowedNavigateUrl(u) === false),
+      deny.filter(u => ap.isAllowedNavigateUrl(u)).join(',') || '全拒绝');
+    ok('F3', 'isAllowedHost 用全等比较而非后缀匹配', (() => {
+      return ap.isAllowedHost('doubao.com') === true &&
+        ap.isAllowedHost('www.doubao.com') === true &&
+        ap.isAllowedHost('passport.doubao.com') === true &&
+        ap.isAllowedHost('evil-doubao.com') === false &&
+        ap.isAllowedHost('doubao.com.evil.test') === false &&
+        ap.isAllowedHost('') === false &&
+        ap.isAllowedHost(null) === false;
+    })());
+    ok('F4', '白名单不含通配符/协议/路径',
+      ap.ALLOWED_HOSTS.every(h => !/[:\/\s*]/.test(h)), ap.ALLOWED_HOSTS.join(','));
+    ok('F5', 'main.js 导航拦截使用 isAllowedNavigateUrl',
+      /isAllowedNavigateUrl/.test(fs.readFileSync(path.join(ROOT, 'src', 'main', 'main.js'), 'utf8')));
+
+    // 旧的宽松正则必须已被移除:它是"只查 hostname 不查协议"的根源
+    const mainSrc2 = fs.readFileSync(path.join(ROOT, 'src', 'main', 'main.js'), 'utf8');
+    ok('F6', 'main.js 不再使用旧的 hostname 后缀正则', !/\/\(\.\|\^\)\.\$\//.test(mainSrc2) && !/\(\.\|\^\)doubao/.test(mainSrc2));
+  }
+
   group('D Provider 协议兼容');
   {
     const lol = require(path.join(ROOT, 'src', 'main', 'plugins', 'builtin', 'lolicon-provider.js'));

@@ -49,13 +49,103 @@ const REQUIRED_COOKIES = [
   'passport_csrf_token', 's_v_web_id',
 ];
 
-// 允许抓取 Cookie 的域名白名单。
+// ---------- 登录地址与域名白名单(唯一来源) ----------
+//
+// 本文件是登录相关 URL 与允许域名的【唯一定义处】。
+// main.js 必须从这里取,不得再写一份 —— 阶段3 审核发现的重复定义
+// (main.js 的 DOUBAO_COOKIE_URLS 与这里的 ALLOWED_COOKIE_URLS 各写一遍)
+// 会导致两边改动不同步,其中一边漏改就直接连错地址。
+//
+// 另一处审核问题:文档里这些地址曾被写成 Markdown 链接形态
+//   [https://www.doubao.com/](https://www.doubao.com/)
+// 这种字符串不是合法 URL,传给 loadURL()/cookies.get() 会抛错或
+// 产生不可预期的行为。assertPureHttpsUrl() 就是用来钉死这一点的:
+// 它不是"防呆注释",而是模块加载时立刻执行的真实断言。
+
+// 登录窗口加载的固定地址
+const LOGIN_URL = 'https://www.doubao.com/chat/';
+
+// 允许抓取/清理 Cookie 的地址。
 // 只碰豆包自己的域,绝不读取用户默认浏览器或其他站点的 Cookie。
 const ALLOWED_COOKIE_URLS = [
   'https://www.doubao.com/',
   'https://doubao.com/',
   'https://passport.doubao.com/',
 ];
+
+// 允许导航与开窗的 hostname 显式白名单。
+//
+// 刻意用"全等集合"而不是后缀正则:
+// 正则 /(^|\.)doubao\.com$/ 虽然恰好能挡住 evil-doubao.com,
+// 但把安全性寄托在正则写法上太脆弱 —— 任何一次"顺手放宽"
+// (比如改成 /doubao\.com/ 或加个 ? 量词)都会静默开口子。
+// 这里是穷举集合,新增子域必须显式加一行,评审时一眼能看见。
+//
+// 明确拒绝的形态(见 t18 F 组反向用例):
+//   evil-doubao.com / doubao.com.evil.test / notdoubao.com / doubao.com.evil.com
+const ALLOWED_HOSTS = [
+  'doubao.com',
+  'www.doubao.com',
+  'passport.doubao.com',
+];
+
+// Markdown 链接痕迹。命中的一律判为非法 URL。
+// 同时覆盖 [x](y) 与 ]( 两种形态。
+const MARKDOWN_LINK_RE = /\]\s*\(|\[[^\]]*\]\s*\(/;
+
+// 纯 HTTPS URL 断言:解析 → 协议 → hostname 白名单 → 无 Markdown 痕迹。
+// 任何一步不过都抛 AuthProtocolError,不做"猜测式修正"。
+function assertPureHttpsUrl(raw, label) {
+  const name = label || 'URL';
+  if (typeof raw !== 'string' || raw === '') bad(name + ' 必须是非空字符串');
+  if (MARKDOWN_LINK_RE.test(raw)) bad(name + ' 不是纯 URL(疑似 Markdown 链接): ' + raw);
+  if (/\s/.test(raw)) bad(name + ' 含空白字符: ' + raw);
+  let u;
+  try { u = new URL(raw); } catch { bad(name + ' 无法被 URL 解析: ' + raw); }
+  if (u.protocol !== 'https:') bad(name + ' 必须使用 https: 协议: ' + raw);
+  if (!ALLOWED_HOSTS.includes(u.hostname)) bad(name + ' 的域名不在白名单内: ' + u.hostname);
+  return u;
+}
+
+// hostname 是否在白名单内(全等比较,大小写归一)。
+// 传进来的必须是已经解析过的 hostname,不接受整条 URL。
+function isAllowedHost(hostname) {
+  if (typeof hostname !== 'string' || !hostname) return false;
+  return ALLOWED_HOSTS.includes(hostname.toLowerCase());
+}
+
+// 导航/开窗判定:先 URL 解析,再校验协议与 hostname。
+// 解析失败、协议不是 https:、hostname 不在白名单 —— 三者任一都返回 false。
+// 调用方拿到 false 必须阻止导航,不存在"拿不准就放行"的分支。
+function isAllowedNavigateUrl(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return false; }
+  if (u.protocol !== 'https:') return false;
+  return isAllowedHost(u.hostname);
+}
+
+// 校验全部 URL 常量。返回 { ok, errors:[], urls:[] }。
+// 供测试直接调用,也供模块加载时自检。
+function validateUrlConstants() {
+  const errors = [];
+  const urls = [];
+  const check = (value, label) => {
+    try { assertPureHttpsUrl(value, label); urls.push(value); }
+    catch (e) { errors.push((e && e.message) || String(e)); }
+  };
+  check(LOGIN_URL, 'LOGIN_URL');
+  ALLOWED_COOKIE_URLS.forEach((u, i) => check(u, 'ALLOWED_COOKIE_URLS[' + i + ']'));
+  if (!Array.isArray(ALLOWED_HOSTS) || ALLOWED_HOSTS.length === 0) {
+    errors.push('ALLOWED_HOSTS 不能为空');
+  } else {
+    for (const h of ALLOWED_HOSTS) {
+      // 白名单项本身不允许带协议、路径、通配符或空白
+      if (typeof h !== 'string' || !h) { errors.push('ALLOWED_HOSTS 含非字符串项'); continue; }
+      if (/[:\/\s*]/.test(h)) errors.push('ALLOWED_HOSTS 项不能含协议/路径/通配符: ' + h);
+    }
+  }
+  return { ok: errors.length === 0, errors, urls };
+}
 
 class AuthProtocolError extends Error {
   constructor(msg) { super(msg); this.name = 'AuthProtocolError'; this.isAuthProtocolError = true; }
@@ -126,9 +216,26 @@ function authFail(err) {
   return fail((err && err.message) || String(err), ERROR_CODES.E_STATE);
 }
 
+// 模块加载时立即自检:URL 常量写错就让 require 直接失败。
+//
+// 放在文件末尾是刻意的 —— 它依赖 AuthProtocolError 与 bad,
+// 而 class 声明处在 TDZ 里,把自检放前面会先抛 ReferenceError
+// 而不是给出"哪个 URL 写错了"的可读信息。
+// 这不是多余的开销:它保证"文档里的地址被写成 Markdown 链接"
+// 这类错误在启动/跑测试的第一秒就暴露,而不是等用户点登录才炸。
+{
+  const selfCheck = validateUrlConstants();
+  if (!selfCheck.ok) {
+    throw new AuthProtocolError('登录 URL 常量校验失败: ' + selfCheck.errors.join(' | '));
+  }
+}
+
 module.exports = {
-  AUTH_TYPES, AUTH_STATES, TRANSITIONS, REQUIRED_COOKIES, ALLOWED_COOKIE_URLS,
+  AUTH_TYPES, AUTH_STATES, TRANSITIONS, REQUIRED_COOKIES,
+  // URL 与域名白名单的唯一来源。main.js 从这里取,不再自己写一份。
+  LOGIN_URL, ALLOWED_COOKIE_URLS, ALLOWED_HOSTS,
   AuthProtocolError, isAuthProtocolError,
   assertAuth, canTransition, assertTransition,
   checkCookieCompleteness, authFail,
+  assertPureHttpsUrl, isAllowedHost, isAllowedNavigateUrl, validateUrlConstants,
 };

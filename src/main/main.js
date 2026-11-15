@@ -20,6 +20,7 @@ const openaiImageProvider = require('./plugins/builtin/openai-image-provider');
 const openaiTextProvider = require('./plugins/builtin/openai-text-provider');
 const pluginLoader = require('./plugins/plugin-loader');
 // 阶段3:豆包个人账号接入。认证与凭据只在主进程内,绝不进 Renderer。
+const authProtocol = require('./plugins/auth/auth-protocol');
 const authManager = require('./plugins/auth/auth-manager');
 const credentialService = require('./services/credential-service');
 const doubaoTransport = require('./plugins/builtin/doubao-transport');
@@ -185,13 +186,17 @@ async function openDoubaoLoginWindow() {
         sandbox: true,
       },
     });
-    // 登录页固定地址,不允许窗口自己跳去别处
-    const LOGIN_URL = 'https://www.doubao.com/chat/';
+    // 登录页固定地址,不允许窗口自己跳去别处。
+    // 地址常量来自 auth-protocol.js(唯一定义处),这里不再重复写一份。
     doubaoLoginWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    // 导航拦截:交给 authProtocol.isAllowedNavigateUrl 判定。
+    //
+    // 旧实现是 /(^|\.)doubao\.com$/.test(host),只校验 hostname、
+    // 不校验协议 —— 意味着 http://www.doubao.com 这类明文地址会被放行。
+    // 现在改为:URL 解析 → 协议必须 https: → hostname 必须精确命中白名单。
+    // 拿不准(解析失败/协议不对/域名不在集合)一律 preventDefault,没有放行分支。
     doubaoLoginWin.webContents.on('will-navigate', (ev, url) => {
-      let host = '';
-      try { host = new URL(url).hostname; } catch {}
-      if (!/(^|\.)doubao\.com$/.test(host)) ev.preventDefault();
+      if (!authProtocol.isAllowedNavigateUrl(url)) ev.preventDefault();
     });
     doubaoLoginWin.on('closed', () => {
       doubaoLoginWin = null;
@@ -201,7 +206,7 @@ async function openDoubaoLoginWindow() {
         authManager.cancelLogin('用户关闭了登录窗口').catch(() => {});
       }
     });
-    await doubaoLoginWin.loadURL(LOGIN_URL);
+    await doubaoLoginWin.loadURL(authProtocol.LOGIN_URL);
     return { ok: true };
   } catch (e) {
     doubaoLoginWin = null;
@@ -217,11 +222,12 @@ function closeDoubaoLoginWindow() {
 }
 
 // 从专用 session 读 Cookie。只碰豆包域,不读用户默认浏览器。
-const DOUBAO_COOKIE_URLS = [
-  'https://www.doubao.com/',
-  'https://doubao.com/',
-  'https://passport.doubao.com/',
-];
+//
+// 地址列表直接用 authProtocol.ALLOWED_COOKIE_URLS —— 阶段3 审核指出
+// 原来 main.js 与 auth-protocol.js 各写了一份同样的三条 URL,
+// 两边一旦不同步,读 Cookie 的域和校验用的域就会错位。
+// 现在只有一处定义,main.js 只是使用者。
+const DOUBAO_COOKIE_URLS = authProtocol.ALLOWED_COOKIE_URLS;
 async function readDoubaoSessionCookies() {
   const ses = getDoubaoSession();
   const map = new Map();
