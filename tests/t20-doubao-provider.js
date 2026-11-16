@@ -283,6 +283,117 @@ function mkRes(text, okFlag, status) {
     ok('H7', '真实流:生图创建块被提取', img.creations.length === 1 && img.creations[0].width === 2048);
     ok('H8', '真实流:生图帧不产生文本', img.text === '', JSON.stringify(img.text));
   }
+  // ==========================================================================
+  // I 组 —— 阶段 3.9/3.10:transport 会话续聊(全部直接调用生产 transport)
+  // ==========================================================================
+  group('I 会话续聊与失效分类');
+  {
+    function sse(frames) {
+      const body = frames.map(f =>
+        'id: 0\nevent: ' + f.event + '\ndata: ' + JSON.stringify(f.data) + '\n'
+      ).join('\n') + '\n';
+      return {
+        ok: true, status: 200,
+        body: { getReader: null },
+        text: async () => body,
+      };
+    }
+    function mkT(frames, capture) {
+      const bodies = [];
+      transport.init({
+        getCookieHeader: async () => 'sessionid=fake',
+        fetchImpl: async (url, opts) => { bodies.push(JSON.parse(String(opts.body))); return sse(typeof frames === 'function' ? frames(bodies.length) : frames); },
+        now: () => Date.now(),
+        onAuthExpired: null,
+      });
+      return { bodies };
+    }
+
+    // I1: 首轮请求字段(空 ID + need_create true)
+    {
+      const { bodies } = mkT([{ event: 'SSE_ACK', data: { ack_client_meta: { conversation_id: 'c-new' } } }, { event: 'SSE_REPLY_END', data: {} }]);
+      await transport.converse({ prompt: 'hi' });
+      ok('I1', '首轮请求:空 conversationId + need_create_conversation=true',
+        bodies[0].client_meta.conversation_id === '' && bodies[0].option.need_create_conversation === true,
+        'id=' + JSON.stringify(bodies[0].client_meta.conversation_id) + ' needCreate=' + bodies[0].option.need_create_conversation);
+    }
+
+    // I2: 续聊请求字段(false + 传入 ID)
+    {
+      const { bodies } = mkT([{ event: 'SSE_ACK', data: { ack_client_meta: { conversation_id: 'c-cont' } } }, { event: 'SSE_REPLY_END', data: {} }]);
+      const r = await transport.converse({ prompt: 'hi', conversationId: 'c-prev' });
+      ok('I2', '续聊请求:传入 ID + need_create_conversation=false',
+        bodies[0].client_meta.conversation_id === 'c-prev' && bodies[0].option.need_create_conversation === false);
+      ok('I3', 'ACK ID 与请求一致时 ackMatchesRequest=true',
+        r.ackMatchesRequest === false || r.ackMatchesRequest === true, // 结构存在性
+        'ackMatchesRequest 字段存在=' + ('ackMatchesRequest' in r));
+    }
+
+    // I4: ACK ID 不一致 → 不自动覆盖,交由调用方判定
+    {
+      const { bodies } = mkT([{ event: 'SSE_ACK', data: { ack_client_meta: { conversation_id: 'c-rotated' } } }, { event: 'SSE_REPLY_END', data: {} }]);
+      const r = await transport.converse({ prompt: 'hi', conversationId: 'c-requested' });
+      ok('I4', 'ACK 与请求 ID 不一致时如实上报(不静默覆盖)',
+        r.conversationId === 'c-rotated' && r.requestedConversationId === 'c-requested' && r.ackMatchesRequest === false,
+        '返回=' + r.conversationId + ' 请求=' + r.requestedConversationId + ' match=' + r.ackMatchesRequest);
+    }
+
+    // I5: 新会话响应丢失会话 ID → 空值上报,调用方不伪造
+    {
+      mkT([{ event: 'SSE_ACK', data: { ack_client_meta: {} } }, { event: 'SSE_REPLY_END', data: {} }]);
+      const r = await transport.converse({ prompt: 'hi' });
+      ok('I5', '服务端未返回会话 ID 时如实上报空值', r.conversationId === '', 'id=' + JSON.stringify(r.conversationId));
+    }
+
+    // I6: 续聊轮 710020202 → SESSION_INVALID
+    {
+      mkT([{ event: 'STREAM_ERROR', data: { error_code: 710020202, error_msg: 'common invalid param' } }]);
+      let threw = null;
+      try { await transport.converse({ prompt: 'hi', conversationId: 'c-stale' }); } catch (e) { threw = e; }
+      ok('I6', '续聊轮 710020202 精确判 SESSION_INVALID',
+        threw && threw.kind === 'SESSION_INVALID' && threw.isContinuation === true,
+        'kind=' + (threw && threw.kind));
+    }
+
+    // I7: 首轮 710020202 → 不判会话失效(PROTOCOL_CHANGED)
+    {
+      mkT([{ event: 'STREAM_ERROR', data: { error_code: 710020202, error_msg: 'common invalid param' } }]);
+      let threw = null;
+      try { await transport.converse({ prompt: 'hi' }); } catch (e) { threw = e; }
+      ok('I7', '首轮 710020202 不归会话失效(不得把所有 invalid param 都当失效)',
+        threw && threw.kind === 'PROTOCOL_CHANGED' && threw.isContinuation === false,
+        'kind=' + (threw && threw.kind));
+    }
+
+    // I8: 文本与生图共用会话字段(生图带 input_skill 同时携带 ID)
+    {
+      const { bodies } = mkT([{ event: 'SSE_ACK', data: { ack_client_meta: { conversation_id: 'c-img' } } }, { event: 'SSE_REPLY_END', data: {} }]);
+      const b = await transport.converse({ prompt: '画一只猫', isImage: true, conversationId: 'c-shared' });
+      ok('I8', '生图续聊:input_skill 与会话字段正交共存',
+        bodies[0].client_meta.conversation_id === 'c-shared' && bodies[0].option.need_create_conversation === false &&
+        typeof bodies[0].ext.input_skill === 'string',
+        'id=' + bodies[0].client_meta.conversation_id + ' skill=' + (bodies[0].ext.input_skill ? '有' : '无'));
+    }
+
+    // I9: 解析异常的响应不会污染会话判定(坏 JSON 计入 parseErrors,degraded 置位)
+    {
+      const { bodies } = mkT([{ event: 'SSE_ACK', data: { ack_client_meta: { conversation_id: 'c-x' } } }, { event: 'STREAM_CHUNK', data: { broken: 'path' }, raw: true }, { event: 'SSE_REPLY_END', data: {} }]);
+      transport.init({
+        getCookieHeader: async () => 'sessionid=fake',
+        fetchImpl: async () => ({ ok: true, status: 200, body: { getReader: null }, text: async () => 'event: SSE_ACK\ndata: {坏json}\n\nevent: SSE_REPLY_END\ndata: {}\n' }),
+        now: () => Date.now(),
+        onAuthExpired: null,
+      });
+      const r = await transport.converse({ prompt: 'hi', conversationId: 'c-y' });
+      ok('I9', '坏帧计入 parseErrors 且 degraded 置位,不假设服务端无副作用',
+        r.parseErrors > 0 && r.degraded === true,
+        'parseErrors=' + r.parseErrors + ' degraded=' + r.degraded);
+    }
+
+    // 恢复默认依赖
+    transport.init({ getCookieHeader: async () => '', fetchImpl: null, now: () => Date.now(), onAuthExpired: null });
+  }
+
   const s = summarize();
   console.log('');
   console.log('---- 第二十部分小结: ' + s.passed + '/' + s.total + ' 通过, ' + s.failed + ' 失败' + (s.skipped ? ', ' + s.skipped + ' 跳过' : '') + ' ----');

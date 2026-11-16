@@ -89,6 +89,7 @@ const AGENT_MODE_CHAT = 2;        // 2=普通对话,1=工作任务【绝不使�
 
 // 错误分类。上层据此决定 UI 文案与是否停止重试。
 const ERR = {
+  SESSION_INVALID: 'SESSION_INVALID',
   AUTH_EXPIRED: 'AUTH_EXPIRED',
   AUTH_REJECTED: 'AUTH_REJECTED',
   RATE_LIMITED: 'RATE_LIMITED',
@@ -107,6 +108,12 @@ function classifyServerError(code, msg) {
   const c = Number(code);
   const m = String(msg || '');
   if (c === 710022004) return ERR.RATE_LIMITED;
+  // 710020202(common invalid param):续聊会话失效的候选信号。
+  // 【证据等级:来自第三方实现长期观察,本项目尚未真实抓包复现——保留此限制。】
+  // 【范围收紧:只有在"续聊轮"(请求带了 conversationId)出现时才按会话失效处理,
+  //   首轮(未带 ID)出现同类错误仍归 PROTOCOL_CHANGED——不得把所有 invalid param
+  //   都当成会话失效。】判定需要"是否续聊"上下文,由 converse 内部完成(见下)。
+  if (c === 710020202) return ERR.SESSION_INVALID;
   if (/captcha|验证码|滑块/i.test(m)) return ERR.CAPTCHA_REQUIRED;
   if (/登录|会话过期|未授权|session/i.test(m)) return ERR.AUTH_EXPIRED;
   if (/invalid param|参数/i.test(m)) return ERR.PROTOCOL_CHANGED;
@@ -166,10 +173,11 @@ function buildBody(prompt, opts) {
       agent_mode: AGENT_MODE_CHAT,
       tts_switch: false, need_deep_think: 0,
       click_clear_context: false, from_suggest: false, is_regen: false, is_replace: false,
+      // 续聊 = false + 非空 ID;新会话 = true + 空 ID(见 client_meta.conversation_id 注释)
+      need_create_conversation: !(typeof o.conversationId === 'string' && o.conversationId),
       is_from_click_option: false, is_from_click_softlink: false, disable_sse_cache: false,
       select_text_action: '', is_select_text: false, resend_for_regen: false,
       scene_type: 0, unique_key: crypto.randomUUID(), start_seq: 0,
-      need_create_conversation: true,
       conversation_init_option: { need_ack_conversation: true },
       conversation_init_ext: { model_item_key: modelKey, reasoning_effort: String(effort), mode_id: '1' },
       regen_query_id: [], edit_query_id: [],
@@ -188,7 +196,12 @@ function buildBody(prompt, opts) {
       },
     },
     client_meta: {
-      local_conversation_id: 'local_' + crypto.randomUUID(), conversation_id: '',
+      local_conversation_id: 'local_' + crypto.randomUUID(),
+      // 会话续聊(阶段3.9/3.10):调用方(主进程 Session Manager)传入上轮服务端
+      // 分配的 conversationId 即为续聊;不传(空)则为新会话。
+      // 协议三要素:续聊 = need_create_conversation:false + 非空 ID(实测验证);
+      // 两者要么都设续聊值、要么都设新会话值,不允许交错。
+      conversation_id: typeof o.conversationId === 'string' ? o.conversationId : '',
       bot_id: BOT_ID, last_section_id: '', last_message_index: null,
       local_permissions: [
         { permission_name: 'ACCESS_COARSE_LOCATION', status: 1 },
@@ -295,14 +308,22 @@ async function converse(opts) {
     // 服务端明确报错 → 分类后抛出
     if (result.errors.length) {
       const first = result.errors[0];
-      const kind = classifyServerError(first.code, first.msg);
+      let kind = classifyServerError(first.code, first.msg);   // SESSION_INVALID 收紧判定可能改写
       // P0-5:明确的服务端账号过期 → 通知主进程把认证状态置为 expired。
       // 只认 AUTH_EXPIRED;RATE_LIMITED/AUTH_REJECTED/其他一律不触发,
       // 防止普通限流或风控被误判成"登录过期"把用户踢下线。
       if (kind === ERR.AUTH_EXPIRED) {
         notifyAuthExpired({ serverCode: first.code, message: String(first.msg || '').slice(0, 100) });
       }
-      throw txError(kind, '豆包返回错误: ' + (first.msg || first.code), { serverCode: first.code });
+      // SESSION_INVALID 精确判定(阶段3.9 S2 + 3.10 收紧):
+      // 只同时满足【本轮是续聊】+【STREAM_ERROR 明确返回】+【错误码精确 710020202】才成立;
+      // 首轮(未带 ID)出现同码仍按原分类(可能与提示词长度/参数相关),不得归为会话失效。
+      const isContinuation = typeof o.conversationId === 'string' && !!o.conversationId;
+      if (kind === ERR.SESSION_INVALID && !isContinuation) {
+        kind = ERR.PROTOCOL_CHANGED;
+      }
+      throw txError(kind, '豆包返回错误: ' + (first.msg || first.code),
+        { serverCode: first.code, isContinuation });
     }
     if (result.overflow) throw txError(ERR.PROTOCOL_CHANGED, '响应体异常过大');
 
@@ -310,10 +331,19 @@ async function converse(opts) {
     const degraded = result.unknownEvents.length > 0 || result.parseErrors > 0
       || (o.isImage ? result.creations.length === 0 : result.text === '');
 
+    // ACK 会话 ID 校验(阶段3.9 S2):
+    // - 续聊请求返回的 conversationId 与请求传入的不一致 → 属于"服务端轮换/异常"。
+    //   这里【不自动决定覆盖】——把两个 ID 都交给调用方(Session Manager)按代次规则处理;
+    //   响应丢失/解析异常时更不能假设服务端没有副作用,一切判定留给主进程。
+    // - 新会话请求返回空 ID → 同样交由调用方按"服务端未返回会话 ID"路径处理。
+    const ackMatchesRequest = result.conversationId === (typeof o.conversationId === 'string' ? o.conversationId : '');
+
     return {
       text: result.text,
       creations: result.creations,
       conversationId: result.conversationId,
+      ackMatchesRequest,
+      requestedConversationId: typeof o.conversationId === 'string' ? o.conversationId : '',
       events: result.events,
       unknownEvents: result.unknownEvents,
       parseErrors: result.parseErrors,
