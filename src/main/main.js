@@ -422,6 +422,16 @@ async function fetchAI(cfg, serviceId, finalPrompt) {
   const engine = (cfg && cfg.ai && cfg.ai.imageEngine) || 'service';
 
   if (engine === 'doubao') {
+    // P0-1(阶段3.10):正常生图路径也要过风险确认。
+    // 审核确认:这里原来没有 requireDoubaoRisk(),只要配置里 imageEngine='doubao',
+    // 定时换图或手动换图就会在用户未确认风险提示的情况下直接消耗豆包生图额度。
+    // 渲染层的按钮隐藏不是安全边界,主进程请求边界才是。
+    // 本地模型设置、取消登录、退出登录不受影响(它们不出网)。
+    const denied = requireDoubaoRisk();
+    if (denied) {
+      // fetchAI 的调用方(change-wallpaper)把异常消息展示给用户,转成可读错误
+      throw new Error('豆包生图需要先确认风险提示: ' + (denied.error || '请先阅读并确认风险提示'));
+    }
     const provider = providerRegistry.get('doubao-image');
     if (!provider) throw new Error('豆包 Provider 不可用');
     const dcfg = cfg.doubao || {};

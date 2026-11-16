@@ -126,7 +126,18 @@ let deps = {
   getCookieHeader: async () => '',
   fetchImpl: null,          // 由 main.js 注入带代理的 netFetch
   now: () => Date.now(),
+  // P0-5(阶段3.10):认证失效通知钩子,由 main.js 接线到 authManager.markExpired。
+  // 只在【明确的服务端账号过期】时触发;HTTP 401/403(AUTH_REJECTED)不算——
+  // 那可能是风控/验证码,不能把用户踢成"已过期"。
+  onAuthExpired: null,
 };
+
+// 触发认证过期通知。回调异常不能影响错误传播(通知是旁路,不是主流程)。
+function notifyAuthExpired(detail) {
+  try {
+    if (typeof deps.onAuthExpired === 'function') deps.onAuthExpired(detail);
+  } catch {}   // 通知失败静默:主流程的错误传播不受旁路影响
+}
 
 function init(opts) {
   deps = Object.assign({}, deps, opts || {});
@@ -285,6 +296,12 @@ async function converse(opts) {
     if (result.errors.length) {
       const first = result.errors[0];
       const kind = classifyServerError(first.code, first.msg);
+      // P0-5:明确的服务端账号过期 → 通知主进程把认证状态置为 expired。
+      // 只认 AUTH_EXPIRED;RATE_LIMITED/AUTH_REJECTED/其他一律不触发,
+      // 防止普通限流或风控被误判成"登录过期"把用户踢下线。
+      if (kind === ERR.AUTH_EXPIRED) {
+        notifyAuthExpired({ serverCode: first.code, message: String(first.msg || '').slice(0, 100) });
+      }
       throw txError(kind, '豆包返回错误: ' + (first.msg || first.code), { serverCode: first.code });
     }
     if (result.overflow) throw txError(ERR.PROTOCOL_CHANGED, '响应体异常过大');

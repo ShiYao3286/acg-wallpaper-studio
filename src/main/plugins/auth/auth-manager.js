@@ -32,6 +32,25 @@ let loginInFlight = false;   // 防重复登录
 // 登录状态的变化通过回调抛给上层(托盘/UI 刷新),避免本模块反向依赖 UI
 let onStateChange = null;
 
+// ---------- P0-2(阶段3.10):登录任务代次 ----------
+//
+// 审核确认的竞态面:pollOnce 与 cancelLogin/logout 竞争、beginLogin 与 cancelLogin
+// 竞争、Cookie 读取或保存挂起时旧任务继续写凭据、取消过早释放登录锁后旧清理
+// 任务影响新登录。
+//
+// 机制:loginEpoch 是单调递增的"当前有效登录任务"编号。
+//   - beginLogin / cancelLogin / logout / __reset / restore 都会递增它;
+//   - 任何异步操作开始前记住自己的 epoch,操作返回后先比对 epoch 再决定是否提交;
+//   - epoch 不匹配 = 这个任务属于已被取消/替换/退出的登录,一律不得写凭据、
+//     不得写状态、不得再触发清理。
+//
+// 这不是锁,是"代次复核":不需要互斥等待,旧任务自然变成空操作。
+// 配合 credential-service 的互斥(P0-3),"取消后凭据复活"的链路被两道闸门堵住。
+let loginEpoch = 0;
+
+// 当前代次快照
+function currentEpoch() { return loginEpoch; }
+
 function init(opts) {
   deps = Object.assign({}, deps, opts || {});
   if (deps.onStateChange) onStateChange = deps.onStateChange;
@@ -74,7 +93,10 @@ async function beginLogin() {
   }
 
   loginInFlight = true;
-  // 新一次登录开始:清掉上一次的成功标记,否则这次取消会被误判成"已成功"而跳过清理
+  // 新一次登录开始:递增代次使一切旧登录任务的异步边界失效(P0-2,见 loginEpoch 注释),
+  // 并清掉上一次的成功标记,否则这次取消会被误判成"已成功"而跳过清理。
+  loginEpoch += 1;
+  const myEpoch = loginEpoch;
   loginCommitted = false;
   setState('opening');
   try {
@@ -83,15 +105,23 @@ async function beginLogin() {
       loginInFlight = false;
       // 开窗失败:窗口可能建了一半,Session 里可能已经写入了豆包域的 Cookie。
       // 这条路径原来完全不清理,现在与其它失败路径一致。
-      const clean = await cleanupAbortedSession('打开登录窗口失败');
-      setState('error', (r && r.error) || '打开登录窗口失败');
-      return { ok: false, error: (r && r.error) || '打开登录窗口失败', cleanup: clean };
+      // epoch 复核:开窗期间登录被取消/退出(epoch 已变)时,本次任务失去清理权与置状态权。
+      const superseded = myEpoch !== loginEpoch;
+      const clean = superseded ? { ok: true, skipped: true, errors: [] } : await cleanupAbortedSession('打开登录窗口失败');
+      if (!superseded) setState('error', (r && r.error) || '打开登录窗口失败');
+      return { ok: false, error: (r && r.error) || '打开登录窗口失败', cleanup: clean, superseded };
     }
   } catch (e) {
     loginInFlight = false;
-    const clean = await cleanupAbortedSession('打开登录窗口异常');
-    setState('error', (e && e.message) || String(e));
-    return { ok: false, error: (e && e.message) || String(e), cleanup: clean };
+    const superseded = myEpoch !== loginEpoch;
+    const clean = superseded ? { ok: true, skipped: true, errors: [] } : await cleanupAbortedSession('打开登录窗口异常');
+    if (!superseded) setState('error', (e && e.message) || String(e));
+    return { ok: false, error: (e && e.message) || String(e), cleanup: clean, superseded };
+  }
+
+  // 开窗成功但期间被取消/退出:不再进入 awaiting_scan,旧任务就此结束。
+  if (myEpoch !== loginEpoch) {
+    return { ok: false, error: '登录已被取消', superseded: true };
   }
 
   setState('awaiting_scan');
@@ -102,15 +132,22 @@ async function beginLogin() {
 
 function schedulePoll() {
   clearScanTimer();
+  const myEpoch = loginEpoch;
   scanTimer = deps.setTimer(async () => {
+    // 代次复核:定时器触发时登录已被取消/退出/重新开始,本轮直接跳过。
+    // 不在这里 re-arm:取消方已 endScan(),state 也不再是 awaiting_scan。
+    if (myEpoch !== loginEpoch || state !== 'awaiting_scan') return;
     try { await pollOnce(); } catch (e) { /* 单次轮询失败不终止流程 */ }
-    if (state === 'awaiting_scan') schedulePoll();
+    if (myEpoch === loginEpoch && state === 'awaiting_scan') schedulePoll();
   }, deps.pollIntervalMs);
 }
 
 // 轮询一次:问 session 要 Cookie,齐全就落盘并置为 authenticated。
+// 每个异步边界(readSessionCookies / credential.save)返回后都必须复核 epoch:
+// Cookie 读取或保存挂起期间用户取消/登出/再次点登录,旧任务一律失去提交权(P0-2)。
 async function pollOnce() {
   if (state !== 'awaiting_scan') return;
+  const myEpoch = loginEpoch;
   if (deps.now() > scanDeadline) {
     await failLogin('等待登录超时,请重新点击登录');
     return;
@@ -123,20 +160,33 @@ async function pollOnce() {
     // 读取失败(窗口刚导航/会话被清)属正常过渡,继续等
     return;
   }
+  // Cookie 读取挂起期间登录被取消/登出/重新开始:本任务立即作废,
+  // 不得用读到的旧 Cookie 提交凭据。
+  if (myEpoch !== loginEpoch || state !== 'awaiting_scan') return;
 
   const check = authProtocol.checkCookieCompleteness(pairs);
   if (!check.ok) return;   // 还没登录完,继续等
 
-  // 拿到完整凭据:先落盘,再清引用,最后置状态
+  // 拿到完整凭据:先落盘,再清引用,最后置状态。
+  // save 挂起期间被取消/登出:credential-service 的互斥(P0-3)保证 clear 优先于迟到的
+  // save;这里的 epoch 复核保证旧任务不写状态、不关窗、不宣告成功。
   try {
     await deps.credential.save(pairs);
   } catch (e) {
-    await failLogin('凭据保存失败: ' + ((e && e.message) || e));
+    if (myEpoch === loginEpoch) await failLogin('凭据保存失败: ' + ((e && e.message) || e));
+    return;
+  }
+  // save 成功返回后再复核一次:保存期间被取消/登出的任务不得宣告登录成功。
+  // 且必须【撤销】这次保存——save 已在 credential-service 的串行链上真实执行,
+  // 单靠"不改状态"会留下刚写入的凭据(退出后凭据复活,P0-2/P0-3 联合场景)。
+  // 撤销动作 clear 也走同一条串行链,排在迟到 save 之后,最终磁盘上无凭据。
+  if (myEpoch !== loginEpoch) {
+    try { await deps.credential.clear(); } catch {}
     return;
   }
 
   // 标记成功:此后任何"关闭窗口 → 取消"的事件都不能再清 Session,
-  // 否则会把刚存好的登录态抹掉(表现为"登录成功但立刻失效")。
+  // 否则会把刚登录成功的会话数据抹掉(表现为"登录成功但立刻失效")。
   loginCommitted = true;
   endScan();
   loginInFlight = false;
@@ -200,6 +250,9 @@ async function cancelLogin(reason) {
   }
   endScan();
   loginInFlight = false;
+  // P0-2:取消使进行中的登录任务全部失效——挂起的 pollOnce/save 返回后 epoch 不匹配,
+  // 自然变成空操作,不会提交凭据、不会置状态、不会与这里的清理竞争。
+  loginEpoch += 1;
   const clean = await cleanupAbortedSession(reason || '用户取消');
   try { deps.closeLoginWindow(); } catch {}
   if (authProtocol.canTransition(state, 'cancelled')) {
@@ -233,11 +286,24 @@ async function cancelLogin(reason) {
 async function logout() {
   endScan();
   loginInFlight = false;
+  // P0-2:退出递增代次——挂起的 pollOnce/save/cleanup 全部失效,旧任务:
+  //   1. 不得提交凭据(pollOnce 的 epoch 复核);
+  //   2. 不得把状态重新拉回 authenticated;
+  //   3. 不得执行自己的 cleanup 与本次退出清理竞争(它会被 skipped)。
+  // 登出后旧任务不得重新建立 authenticated 状态,由这条保证。
+  loginEpoch += 1;
   // 退出即视为放弃本次登录:此后关窗事件不应再触发清理逻辑
   loginCommitted = false;
   try { deps.closeLoginWindow(); } catch {}
 
   const errors = [];
+
+  // P0-3:先排空凭据写链(在途的迟到 save 先完成),再执行 clear。
+  // 这样 clear 在链上排在一切在途 save 之后,复核 has() 读到的就是最终态,
+  // 不会把"恰好夹在中间的迟到 save"误判成"凭据仍在"。
+  try {
+    if (typeof deps.credential.flushWriteChain === 'function') await deps.credential.flushWriteChain();
+  } catch {}
 
   // 凭据删除
   let credentialCleared = false;
@@ -319,6 +385,8 @@ function markExpired(reason) {
 
 // 应用启动时恢复:有可用凭据就置 authenticated,否则保持 idle
 async function restore() {
+  // 启动恢复是全新一代:此前任何在途登录任务(理论上不存在,防御性兜底)全部失效
+  loginEpoch += 1;
   loginCommitted = false;
   let ok = false;
   try { ok = await deps.credential.has(); } catch { ok = false; }
@@ -337,6 +405,8 @@ async function restore() {
 // 仅供测试:重置到初始态
 function __reset() {
   endScan();
+  // 测试隔离:清掉所有在途任务的提交权
+  loginEpoch += 1;
   state = 'idle'; lastError = ''; loginInFlight = false; loginCommitted = false;
 }
 

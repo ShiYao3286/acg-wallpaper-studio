@@ -409,6 +409,58 @@ function mkSafe(o) {
     ok('H18', '登录中途退出登录能回到 idle(不卡在 awaiting_scan)',
       stAfter.state === 'idle', '退出后 state=' + stAfter.state);
 
+    // ---------------------------------------------------------------
+    // P0-1(阶段3.10):正常生图路径的风险确认回归测试。
+    // 审核确认:fetchAI 的豆包分支原来没有 requireDoubaoRisk(),配置了
+    // imageEngine='doubao' 的定时换图会在未确认风险时直接消耗生图额度。
+    // 这里走真实 main.js 的 change-wallpaper handler 验证主进程边界。
+    // ---------------------------------------------------------------
+    {
+      // 配置成豆包生图引擎 + AI 源(经 save-config,走真实配置链路)
+      await call('save-config', 'ai.imageEngine', 'doubao');
+      await call('save-config', 'source', 'ai');
+      // 主进程侧重置风险状态(模拟重启后的真实状态)
+      await call('doubao-accept-risk', false);
+
+      // 探针:拦截全局 fetch,若有人真发豆包请求就计败(不出网)
+      const origFetch = globalThis.fetch;
+      let doubaoNetCalls = 0;
+      globalThis.fetch = (url, opts) => {
+        if (/doubao\.com/.test(String(url))) { doubaoNetCalls++; return Promise.reject(new Error('测试拦截:不应出网')); }
+        return origFetch(url, opts);
+      };
+
+      let r;
+      try {
+        // 未确认风险 → change-wallpaper('ai-explicit') 必须失败,错误信息指向风险提示
+        r = await call('change-wallpaper', 'ai-explicit');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+
+      ok('H19', 'P0-1:未确认风险时正常生图(change-wallpaper)被主进程拦截',
+        r && r.ok === false && /风险/.test(String(r.error || '')),
+        JSON.stringify({ ok: r && r.ok, error: r && r.error }).slice(0, 140));
+      ok('H20', 'P0-1:拦截发生在任何豆包网络请求之前',
+        doubaoNetCalls === 0, '豆包出网次数=' + doubaoNetCalls);
+
+      // 确认风险后同一通道不再被风险门禁拦住(其余链路行为不受影响:
+      // 真正的生图会因测试环境无凭据服务而走 mock 之外的路,这里只验证门禁放行)
+      await call('doubao-accept-risk', true);
+      const origFetch2 = globalThis.fetch;
+      globalThis.fetch = (url, opts) => {
+        if (/doubao\.com/.test(String(url))) { doubaoNetCalls++; return Promise.reject(new Error('测试拦截')); }
+        return origFetch2(url, opts);
+      };
+      let r2;
+      try { r2 = await call('change-wallpaper', 'ai-explicit'); } finally { globalThis.fetch = origFetch2; }
+      ok('H21', 'P0-1:确认风险后生图不再被风险门禁拦截',
+        !(r2 && r2.ok === false && /风险/.test(String(r2.error || ''))),
+        JSON.stringify({ ok: r2 && r2.ok, error: r2 && String(r2.error || '').slice(0, 80) }));
+      // 恢复:会话状态测试部分依赖风险确认
+      await call('doubao-accept-risk', false);
+    }
+
     try { closeAllWatchers(); } catch {}
   }
 
