@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld('api', {
     cancelLogin: () => ipcRenderer.invoke('doubao-cancel-login'),
     logout: () => ipcRenderer.invoke('doubao-logout'),
     openLoginWindow: () => ipcRenderer.invoke('doubao-open-login-window'),
+  sessionStatus: () => ipcRenderer.invoke('doubao-session-status'),
+  newSession: () => ipcRenderer.invoke('doubao-new-session'),
     riskAccepted: () => ipcRenderer.invoke('doubao-risk-accepted'),
     acceptRisk: (accepted) => ipcRenderer.invoke('doubao-accept-risk', accepted),
     testText: (prompt) => ipcRenderer.invoke('doubao-test-text', prompt),

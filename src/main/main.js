@@ -23,6 +23,7 @@ const pluginLoader = require('./plugins/plugin-loader');
 const authProtocol = require('./plugins/auth/auth-protocol');
 const authManager = require('./plugins/auth/auth-manager');
 const credentialService = require('./services/credential-service');
+const sessionService = require('./services/session-service');
 const doubaoTransport = require('./plugins/builtin/doubao-transport');
 const doubaoProvider = require('./plugins/builtin/doubao-provider');
 // 换壁纸事务(阶段2 第6步从 main.js 迁出)
@@ -307,7 +308,115 @@ doubaoTransport.init({
   getCookieHeader: () => credentialService.getCookieHeader(),
   fetchImpl: (url, opts) => netFetch(url, opts),
   now: () => Date.now(),
+  // P0-5(阶段3.10):认证失效通知接线。transport 只在服务端明确报账号过期
+  // (AUTH_EXPIRED)时回调;401/403(AUTH_REJECTED)、限流、网络错误不会触发。
+  // 动作:authenticated → expired(状态机校验,状态不符则不动)+ 清凭据缓存。
+  onAuthExpired: (detail) => {
+    const changed = authManager.markExpired(
+      '登录已过期' + (detail && detail.serverCode ? '(服务端码 ' + detail.serverCode + ')' : '')
+    );
+    if (changed) credentialService.invalidateCache();
+  },
 });
+
+// ---------- 阶段3.9/3.10:豆包持久化工作会话(主进程统一调度) ----------
+//
+// 职责:所有豆包对话请求(文本/生图/提示词助手/测试通道)统一走 requestDoubaoTurn。
+// 它负责:读绑定 → 决定续聊或新建 → 调 transport → 响应写回(带代次复核) →
+// SESSION_INVALID 处理。Session Manager 管【状态】,这里管【调度】。
+//
+// 并发(任务书第五节):全局串行队列。文本与生图不允许绕过彼此并发——
+// 单用户桌面应用,串行的吞吐代价可忽略,换来的是同会话上下文绝不会交错。
+// generation 代次保护写回:新建会话/登出/换号都会使在途请求的写回权失效。
+sessionService.init({ userDataDir: app.getPath('userData'), now: () => Date.now() });
+
+// 全局串行链。失败不阻断后续请求。
+let doubaoTurnChain = Promise.resolve();
+function enqueueDoubaoTurn(task) {
+  const run = doubaoTurnChain.then(task, task);
+  doubaoTurnChain = run.catch(() => {});
+  return run;
+}
+
+// 获取当前账号绑定指纹(登录后凭据可用时)。
+// 注意:指纹可能因服务端轮换而变化,变化即作废绑定 → 新会话,错误方向安全(多建会话,不串号)。
+async function currentAccountKey() {
+  try {
+    const pairs = await credentialService.describe().then(() => null);
+  } catch {}
+  // describe() 不返回 Cookie 值,指纹计算需要读取凭据头——只在主进程内完成,不落日志。
+  try {
+    const header = await credentialService.getCookieHeader();
+    if (!header) return '';
+    const map = new Map();
+    for (const kv of header.split('; ')) {
+      const eq = kv.indexOf('=');
+      if (eq > 0) map.set(kv.slice(0, eq), kv.slice(eq + 1));
+    }
+    return sessionService.computeAccountKey(map);
+  } catch { return ''; }
+}
+
+// 统一会话回合入口。
+// opts: { prompt, isImage, timeoutMs, modelKey, reasoningEffort, signal }
+// 返回 transport.converse 的结果(含 conversationId/ackMatchesRequest)。
+// 抛出 transport 的已分类错误;SESSION_INVALID 已在内部处理绑定标记。
+function requestDoubaoTurn(opts) {
+  const o = opts || {};
+  return enqueueDoubaoTurn(async () => {
+    const accountKey = await currentAccountKey();
+    // 账号切换判定:指纹变化 → 作废旧绑定(任务书 3.1 兜底)
+    await sessionService.reconcileAccount(accountKey);
+    const binding = sessionService.getBinding();
+    // 续聊条件:绑定存在、未失效、账号匹配。否则按首次创建(空 ID + true)。
+    const useContinuation = !!(binding && binding.conversationId && !binding.defunct && binding.accountKey === accountKey);
+    const genAtStart = binding ? binding.generation : 0;
+
+    let result;
+    try {
+      result = await doubaoTransport.converse({
+        prompt: o.prompt,
+        isImage: !!o.isImage,
+        conversationId: useContinuation ? binding.conversationId : '',
+        modelKey: o.modelKey,
+        reasoningEffort: o.reasoningEffort,
+        timeoutMs: o.timeoutMs,
+        signal: o.signal,
+      });
+    } catch (e) {
+      // 会话失效(候选码 710020202,证据等级见 transport 注释):
+      // 标记绑定失效(代次保护),下一次请求按新会话走。
+      // 【不就地重建】:重建=自动重试,可能一次操作两次额度,交给用户手动重试。
+      if (e && e.kind === 'SESSION_INVALID') {
+        await sessionService.markSessionInvalid(genAtStart);
+      }
+      throw e;
+    }
+
+    // 响应写回——代次复核:请求开始后若发生 新建会话/登出/换号,
+    // 本请求失去一切写回权(任务书第五节),直接返回结果但不改状态。
+    const cur = sessionService.getBinding();
+    const genNow = cur ? cur.generation : 0;
+    if (genAtStart !== genNow || (useContinuation && cur && cur.accountKey !== accountKey)) {
+      return result;   // 旧代次:conversationId/状态/熔断都不写回
+    }
+
+    // ACK 一致性校验:
+    // - 续聊:返回 ID 与请求不同(服务端轮换)→ 以服务端为准更新绑定(实测未见轮换,防御性处理);
+    //   若响应里根本没有 ID,不覆盖旧绑定(响应丢失不假设服务端无副作用)。
+    // - 新会话:必须拿到 ID 才落绑定;空 ID 上报给调用方,不伪造。
+    if (useContinuation) {
+      if (result.conversationId && result.conversationId !== binding.conversationId) {
+        await sessionService.setBinding({ conversationId: result.conversationId, accountKey, expectedGeneration: genAtStart });
+      } else if (result.conversationId === binding.conversationId) {
+        sessionService.markUsed();
+      }
+    } else if (result.conversationId) {
+      await sessionService.setBinding({ conversationId: result.conversationId, accountKey, expectedGeneration: genAtStart });
+    }
+    return result;
+  });
+}
 const confDir = configService.confDir;
 const confFile = configService.confFile;
 const deepMerge = configService.deepMerge;
@@ -438,7 +547,8 @@ async function fetchAI(cfg, serviceId, finalPrompt) {
     const res = await provider.generate({
       config: cfg,
       netFetch,
-      doubao: { converse: (o) => doubaoTransport.converse(o) },
+      // 阶段3.9:走统一会话调度(串行队列 + 代次),Provider 无感知
+      doubao: { converse: (o) => requestDoubaoTurn(o) },
       prompt: finalPrompt,
       modelKey: dcfg.textModel,
       timeoutMs: 180000,
@@ -1131,6 +1241,32 @@ ipcMain.handle('doubao-status', async () => {
   };
 });
 
+// ---------- 阶段3.9:工作会话 IPC ----------
+// 会话状态只回布尔量与时间戳,【绝不返回 conversationId】(任务书第七节)。
+ipcMain.handle('doubao-session-status', async () => {
+  const b = sessionService.getBinding();
+  const accountKey = await currentAccountKey();
+  // 账号不符的绑定视为"无会话"(reconcile 会在下一次请求时正式作废)
+  const live = !!(b && b.conversationId && !b.defunct && (!b.accountKey || !accountKey || b.accountKey === accountKey));
+  return {
+    hasSession: live,
+    invalid: !!(b && b.defunct),
+    createdAt: live ? b.createdAt : 0,
+    lastUsedAt: live ? b.lastUsedAt : 0,
+    loggedOut: !(await credentialService.has().catch(() => false)),
+  };
+});
+
+// 新建会话:用户主动操作。立即递增代次并清空 conversationId——
+// 从此刻起在途旧请求失去写回权;旧会话在豆包账号侧仍存在(服务端留痕,无法关闭,UI 已说明)。
+ipcMain.handle('doubao-new-session', async () => {
+  const denied = requireDoubaoRisk();
+  if (denied) return denied;
+  const accountKey = await currentAccountKey();
+  const r = await sessionService.newSession(accountKey);
+  return ok({ generation: r.generation });
+});
+
 // ---------- 豆包风险确认(主进程统一把关) ----------
 //
 // 阶段3 审核指出的问题:doubao-login 完全没查 hasAcceptedDoubaoRisk,
@@ -1186,6 +1322,9 @@ ipcMain.handle('doubao-logout', async () => {
   try {
     const r = await authManager.logout();
     credentialService.invalidateCache();
+    // 阶段3.9:登出连带清本地会话绑定(任务书第五节)。
+    // 失败如实降级——残留绑定最多导致下一次请求 SESSION_INVALID,不泄露凭据。
+    try { await sessionService.clearBinding(); } catch {}
     if (r && r.ok) return ok({ state: r.state, credentialCleared: true, sessionCleared: true });
     // 部分失败:明确告诉渲染层哪一步没成,不做"看起来成功"的包装。
     // 错误消息来自 authManager,内部已保证不含 Cookie 值。
@@ -1273,7 +1412,7 @@ ipcMain.handle('doubao-test-text', async (e, prompt) => {
   const cfg = await loadConfig();
   const dcfg = cfg.doubao || {};
   try {
-    const r = await doubaoTransport.converse({
+    const r = await requestDoubaoTurn({
       prompt: text, isImage: false,
       modelKey: dcfg.textModel, reasoningEffort: dcfg.reasoningEffort,
       timeoutMs: 60000,
@@ -1298,7 +1437,7 @@ ipcMain.handle('doubao-test-image', async (e, prompt) => {
     const dcfg2 = cfg2.doubao || {};
     const res = await doubaoProvider.imageProvider.generate({
       config: { ai: { prompt: text } },
-      doubao: { converse: (o) => doubaoTransport.converse(o) },
+      doubao: { converse: (o) => requestDoubaoTurn(o) },
       netFetch,
       prompt: text,
       modelKey: dcfg2.textModel,       // 生图同样用选中的载体模型
@@ -1511,6 +1650,9 @@ if (!app.requestSingleInstanceLock()) {
     // 阶段3:恢复豆包登录状态。有凭据就置 authenticated,否则保持 idle。
     // 必须在窗口创建之后调用,这样 onStateChange 能推送到渲染层。
     try { await authManager.restore(); } catch (e) { /* 恢复失败不阻塞启动 */ }
+    // 阶段3.9:恢复会话绑定。损坏/版本不符时 session-service 内部安全降级,不阻塞启动。
+    // 账号指纹不符的绑定会在下一次请求时被 reconcileAccount 作废(换号/重登场景)。
+    try { await sessionService.restore(); } catch (e) { /* 恢复失败不阻塞启动 */ }
     startWatcher();
   });
 }

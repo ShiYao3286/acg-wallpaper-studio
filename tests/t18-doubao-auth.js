@@ -461,6 +461,42 @@ function mkSafe(o) {
       await call('doubao-accept-risk', false);
     }
 
+
+    // ---------------------------------------------------------------
+    // J 组 —— 阶段 3.9/3.10:持久化工作会话(走真实 main.js 的 IPC 与调度层)
+    // ---------------------------------------------------------------
+    {
+      // 确认风险(会话 IPC 受风险门禁)
+      await call('doubao-accept-risk', true);
+
+      const st0 = await call('doubao-session-status');
+      ok('J1', 'doubao-session-status 返回状态结构(无 conversationId)',
+        st0 && typeof st0.hasSession === 'boolean' && !('conversationId' in st0),
+        JSON.stringify(st0));
+
+      // 新建会话(无凭据环境下 accountKey 为空,绑定仍应可建立代次)
+      const ns = await call('doubao-new-session');
+      ok('J2', '新建会话返回代次且递增', ns && ns.ok === true && typeof ns.generation === 'number',
+        JSON.stringify(ns));
+      const ns2 = await call('doubao-new-session');
+      ok('J3', '再次新建代次继续递增',
+        ns2 && ns2.ok === true && ns2.generation === ns.generation + 1,
+        'gen ' + ns.generation + ' -> ' + (ns2 && ns2.generation));
+
+      // 风险门禁:未确认风险时新建会话被拒
+      await call('doubao-accept-risk', false);
+      const denied = await call('doubao-new-session');
+      ok('J4', '未确认风险时新建会话被拒(新 IPC 同样过风险门禁)',
+        denied && denied.ok === false && /风险/.test(String(denied.error || '')),
+        JSON.stringify(denied).slice(0, 100));
+      await call('doubao-accept-risk', true);
+
+      // 会话状态在登出后清空(loggedOut / hasSession=false)
+      const st1 = await call('doubao-session-status');
+      ok('J5', '登出状态下会话状态如实显示',
+        st1 && typeof st1.loggedOut === 'boolean', JSON.stringify(st1));
+    }
+
     try { closeAllWatchers(); } catch {}
   }
 
