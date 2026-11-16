@@ -52,6 +52,7 @@ const CLICK_ACTIONS = {
   'doubao-relogin': () => doubaoLogin(),
   'doubao-cancel-login': () => api.doubao.cancelLogin().then(() => refreshDoubao()).catch(() => {}),
   'doubao-logout': () => doubaoLogout(),
+  'doubao-new-session': () => doubaoNewSession(),
   'doubao-accept-risk': () => doubaoAcceptRisk(),
   'doubao-decline-risk': () => doubaoDeclineRisk(),
   'doubao-test-text': () => doubaoTestText(),
@@ -289,6 +290,32 @@ async function refreshDoubao() {
       act.style.display = (doubaoRiskAccepted || needsManageAction) ? '' : 'none';
     }
 
+    // 阶段3.9:工作会话状态行(不展示 conversationId)
+    const sessBox = $('doubao-session');
+    if (sessBox) {
+      if (st.state === 'authenticated') {
+        try {
+          const ss = await api.doubao.sessionStatus();
+          let text;
+          if (ss.invalid) {
+            text = '当前工作会话已失效。下一次请求将自动创建新会话，之前的上下文不会自动继承。';
+            sessBox.style.color = '#fbbf24';
+          } else if (ss.hasSession) {
+            text = '工作会话进行中 · 自 ' + new Date(ss.createdAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) + ' 起。连续对话会继承此前上下文，旧要求可能影响后续结果。';
+            sessBox.style.color = '';
+          } else {
+            text = '尚未建立工作会话，下一次请求会自动创建。';
+            sessBox.style.color = '';
+          }
+          sessBox.textContent = text;
+          sessBox.style.display = '';
+        } catch { sessBox.style.display = 'none'; }
+      } else {
+        sessBox.textContent = '';
+        sessBox.style.display = 'none';
+      }
+    }
+
     // 模型选择区:仅登录后显示;未登录时没有意义
     const modelBox = $('doubao-models');
     if (modelBox) {
@@ -363,6 +390,18 @@ async function doubaoTestImage() {
     if (r && r.errorKind === 'AUTH_EXPIRED') refreshDoubao();
   } catch (e) {
     toast('生图请求失败: ' + ((e && e.message) || e), 6000);
+  }
+}
+
+// 新建会话:确认提示明确告知"旧上下文不继承"(任务书 S4)。
+async function doubaoNewSession() {
+  if (!confirm('确定新建豆包工作会话吗？\n\n· 新会话不会继承当前对话的上下文。\n· 旧会话的记录仍保留在你的豆包账号中。')) return;
+  try {
+    const r = await api.doubao.newSession();
+    toast(r && r.ok ? '已新建工作会话,下一次请求生效' : '新建会话失败: ' + ((r && r.error) || '未知'), 4000);
+    refreshDoubao();
+  } catch (e) {
+    toast('新建会话失败: ' + ((e && e.message) || e), 4000);
   }
 }
 
