@@ -494,6 +494,97 @@ function mkSafe(o) {
       if (!m) return false;
       return m[1].includes("'authenticated'") && m[1].includes("'awaiting_scan'");
     })(), '命中 needsManageAction 判断');
+
+    // ------------------------------------------------------------------
+    // I13/I14 —— 真正执行 refreshDoubao 的显示判断
+    //
+    // 这两项来自变异测试:把
+    //   act.style.display = (doubaoRiskAccepted || needsManageAction) ? '' : 'none';
+    // 改成只看 doubaoRiskAccepted 后,I1–I12【全部仍然通过】。
+    // 原因:I1–I12 只测了 doubaoButtons 这个纯函数,
+    // 以及 needsManageAction 这一行"是否存在",都没有真正执行可见性计算。
+    // 于是"代码里写了却没被用上"这种回退根本抓不到。这是真实覆盖盲区。
+    //
+    // 做法:把 refreshDoubao 整段拿出来,配最小 DOM/API 桩在 vm 里真跑一遍,
+    // 然后看 doubao-actions 的 display 到底算成了什么。
+    // ------------------------------------------------------------------
+    {
+      const startR = rSrc.indexOf('async function refreshDoubao(');
+      let endR = -1;
+      if (startR >= 0) {
+        let j = rSrc.indexOf('{', startR), dep = 0;
+        for (; j < rSrc.length; j++) {
+          if (rSrc[j] === '{') dep++;
+          else if (rSrc[j] === '}') { dep--; if (dep === 0) { endR = j + 1; break; } }
+        }
+      }
+      const refreshSrc = (startR >= 0 && endR > startR) ? rSrc.slice(startR, endR) : '';
+      ok('I13', '能从真实 renderer.js 提取 refreshDoubao', refreshSrc.length > 0, '长度 ' + refreshSrc.length + 'B');
+
+      // 最小 DOM + api 桩:只实现 refreshDoubao 用到的部分
+      function runRefresh(stateObj, riskAccepted) {
+        const nodes = new Map();
+        const mkNode = () => ({ textContent: '', style: { display: '', color: '' }, dataset: {}, children: [],
+          appendChild(c) { this.children.push(c); }, });
+        const actNode = mkNode();
+        const riskNode = mkNode();
+        const modelNode = mkNode();
+        const $ = (id) => {
+          if (id === 'doubao-actions') return actNode;
+          if (id === 'doubao-risk') return riskNode;
+          if (id === 'doubao-models') return modelNode;
+          if (id === 'doubao-status-text') return (nodes.get(id) || (nodes.set(id, mkNode()), nodes.get(id)));
+          return null;
+        };
+        const vm2 = require('node:vm');
+        const ctx2 = {
+          $,
+          api: {
+            doubao: {
+              status: async () => stateObj,
+              riskAccepted: async () => ({ accepted: riskAccepted }),
+              models: async () => ({ models: [], current: '0', effortLevels: [] }),
+            },
+          },
+          toast: () => {},
+          doubaoStateText: () => ({ text: '', color: '' }),
+          refreshDoubaoModels: async () => {},
+          document: { createElement: () => mkNode() },
+        };
+        vm2.createContext(ctx2);
+        // 把真实的 doubaoButtons 源码与 refreshDoubao 一起放进同一个上下文，
+        // 否则 refreshDoubao 内部引用的 doubaoButtons 在沙箱里不存在。
+        vm2.runInContext(fnSrc + ';' + refreshSrc + '; this.__refresh = refreshDoubao;', ctx2);
+        return ctx2.__refresh().then(() => ({
+          actionsDisplay: actNode.style.display,
+          riskDisplay: riskNode.style.display,
+          buttons: actNode.children.map(c => c.dataset && c.dataset.act),
+        }));
+      }
+
+      // 核心场景:已登录 + 风险未确认 → 操作区必须可见,且含退出账号
+      const s1 = await runRefresh({ state: 'authenticated', encryptionAvailable: true }, false);
+      ok('I14', '已登录且风险未确认时操作区 display 不为 none(真正执行判定)',
+        s1.actionsDisplay !== 'none',
+        'display="' + s1.actionsDisplay + '" 按钮=' + JSON.stringify(s1.buttons));
+
+      // 反向:未登录 + 未确认 → 操作区应当隐藏
+      const s2 = await runRefresh({ state: 'idle', encryptionAvailable: true }, false);
+      ok('I15', '未登录且风险未确认时操作区隐藏',
+        s2.actionsDisplay === 'none',
+        'display="' + s2.actionsDisplay + '"');
+
+      // 已确认 + 未登录 → 可见
+      const s3 = await runRefresh({ state: 'idle', encryptionAvailable: true }, true);
+      ok('I16', '已确认风险时操作区可见',
+        s3.actionsDisplay !== 'none',
+        'display="' + s3.actionsDisplay + '"');
+
+      // 已登录 + 未确认 → 退出按钮必须在 DOM 里
+      ok('I17', '已登录且风险未确认时 DOM 里有退出账号按钮',
+        s1.buttons.includes('doubao-logout'),
+        JSON.stringify(s1.buttons));
+    }
   }
 
   // ==========================================================================
@@ -556,8 +647,13 @@ function mkSafe(o) {
     let r2 = mkEnv({ cookieQueue: [FULL], clearThrows: true });
     await am.beginLogin(); await sleep(80);
     const out2 = await am.logout();
+    // 注意:证据串里必须对 errors 做防御性取值。
+    // 变异测试暴露过这个问题:把 logout 改回"吞异常 + 永远 ok:true"的旧写法后,
+    // out2.errors 变成 undefined,直接 .length 会抛 TypeError,
+    // 导致整个测试文件崩溃退出(exit=2)、后续 15 个 G 组用例全部丢失,
+    // 表面看只是"1 项失败",实际是"测试没跑完"—— 这比失败更危险。
     ok('G2', '凭据删除失败时不得报成功', out2.ok === false && out2.credentialCleared === false,
-      JSON.stringify({ ok: out2.ok, errors: out2.errors.length }));
+      JSON.stringify({ ok: out2.ok, errors: Array.isArray(out2.errors) ? out2.errors.length : '(缺 errors 字段)' }));
     ok('G2b', '凭据删除失败时状态不伪装成完全退出',
       am.getState().state === 'authenticated' && out2.credentialRemaining === true,
       'state=' + am.getState().state);
@@ -572,15 +668,19 @@ function mkSafe(o) {
     let r4 = mkEnv({ cookieQueue: [FULL], clearThrows: true, clearSessionResult: { ok: false, removed: 0, failed: ['x'], errors: ['mock fail'] } });
     await am.beginLogin(); await sleep(80);
     const out4 = await am.logout();
+    // 同 G2:对 errors 做防御性取值,避免生产代码回退时测试崩溃而非失败
+    const errs4 = Array.isArray(out4.errors) ? out4.errors : [];
     ok('G4', '两者同时失败仍能明确报告失败',
       out4.ok === false && out4.credentialCleared === false && out4.sessionCleared === false &&
-      out4.errors.length >= 1, out4.errors.join(' | ').slice(0, 120));
+      errs4.length >= 1, errs4.join(' | ').slice(0, 120) || '(无 errors 数组)');
 
     let r5 = mkEnv({ cookieQueue: [FULL], clearSessionThrows: true });
     await am.beginLogin(); await sleep(80);
     const out5 = await am.logout();
+    const errs5 = Array.isArray(out5.errors) ? out5.errors : [];
     ok('G5', 'Session 清理抛异常被捕获且不报成功',
-      out5.ok === false && /Session/.test(out5.errors.join(' ')));
+      out5.ok === false && /Session/.test(errs5.join(' ')),
+      errs5.join(' | ').slice(0, 100) || '(无 errors 数组)');
 
     ok('G6', '错误信息不含 Cookie 值(只有名字/原因)',
       [out1, out2, out3, out4, out5].every(o => (o.errors || []).every(e => !/v-sessionid|v-uid_tt|v-ttwid/.test(e))),
@@ -591,7 +691,7 @@ function mkSafe(o) {
     const out7 = await am.logout();
     ok('G7', 'clear() 不抛错但凭据仍在时,以 has() 复核结果为准',
       out7.credentialRemaining === true && out7.ok === false,
-      'credentialRemaining=' + out7.credentialRemaining);
+      'credentialRemaining=' + String(out7.credentialRemaining) + ' ok=' + String(out7.ok));
 
     // --- 失败/取消路径的 Session 清理 ---
     let r8 = mkEnv({ cookieQueue: [[]] });
@@ -642,6 +742,90 @@ function mkSafe(o) {
     ok('G15', '清理失败被记录为可诊断状态',
       /清理/.test(am.getState().lastError) && !/v-sessionid/.test(am.getState().lastError),
       'lastError=' + am.getState().lastError.slice(0, 60));
+
+    // ------------------------------------------------------------------
+    // G16/G17 —— loginCommitted 竞态保护的直测
+    //
+    // 这两项来自变异测试:把 cleanupAbortedSession 里的
+    //   if (loginCommitted) return { ok:true, skipped:true }
+    // 整行删掉后,原有用例【全部仍然通过】—— 说明此前没有任何测试
+    // 真正覆盖这条保护。这是变异测试才发现的有效缺口。
+    //
+    // 为什么原来的 G13 抓不到:
+    //   G13 在 authenticated 状态下调 cancelLogin,而 cancelLogin 对
+    //   「没有进行中的登录」会直接 return ok:false,根本走不到清理逻辑。
+    //   真正危险的是另一种时序:pollOnce 里先 setState('authenticated')
+    //   之前的 closeLoginWindow() 触发 'closed' 事件,那时状态仍是
+    //   awaiting_scan,主进程的 closed 回调会立刻调 cancelLogin →
+    //   若不看 loginCommitted,就会把刚刚保存的凭据对应的 Session 抹掉。
+    //
+    // 这里直接模拟那个时序:让 closeLoginWindow 同步触发真实会发生的
+    // 「关窗→取消」回调,检查 clearSession 是否被调用。
+    // ------------------------------------------------------------------
+    {
+      const rec = { cleared: 0, stored: null, cancelResult: null };
+      am.__reset();
+      let pollIdx2 = 0;
+      am.init({
+        openLoginWindow: async () => ({ ok: true }),
+        // 关键:关窗时同步触发与 main.js 中 'closed' 回调等价的逻辑
+        closeLoginWindow: () => {
+          // main.js 的实现:关窗后若状态仍是 awaiting_scan/opening 就取消
+          const st = am.getState();
+          if (st.state === 'awaiting_scan' || st.state === 'opening') {
+            rec.cancelResult = am.cancelLogin('用户关闭了登录窗口');
+          }
+        },
+        clearSession: async () => { rec.cleared++; return { ok: true, removed: 1, failed: [], errors: [] }; },
+        credential: {
+          async save(p) { rec.stored = [...p.keys()]; },
+          async has() { return rec.stored !== null; },
+          async clear() { rec.stored = null; },
+        },
+        readSessionCookies: async () => {
+          const m = new Map();
+          const arr = pollIdx2++ === 0 ? [] : FULL;
+          arr.forEach(n => m.set(n, 'v-' + n));
+          return m;
+        },
+        pollIntervalMs: 5, scanTimeoutMs: 60000,
+        setTimer: (fn, ms) => setTimeout(fn, ms),
+        clearTimer: (t) => clearTimeout(t),
+        now: () => Date.now(),
+      });
+
+      await am.beginLogin();
+      await sleep(120);   // 等轮询拿到完整 Cookie → save → closeLoginWindow
+
+      ok('G16', '登录成功瞬间关窗不会误清 Session(loginCommitted 生效)',
+        rec.stored !== null && rec.cleared === 0 && am.getState().state === 'authenticated',
+        'stored=' + (rec.stored ? rec.stored.length : 0) + ' cleared=' + rec.cleared + ' state=' + am.getState().state);
+
+      // 反向确认:没登录成功时,同样的关窗时序必须清理
+      const rec2 = { cleared: 0 };
+      let pollIdx3 = 0;
+      am.__reset();
+      am.init({
+        openLoginWindow: async () => ({ ok: true }),
+        closeLoginWindow: () => {
+          const st = am.getState();
+          if (st.state === 'awaiting_scan' || st.state === 'opening') {
+            am.cancelLogin('用户关闭了登录窗口');
+          }
+        },
+        clearSession: async () => { rec2.cleared++; return { ok: true, removed: 1, failed: [], errors: [] }; },
+        credential: { async save() {}, async has() { return false; }, async clear() {} },
+        readSessionCookies: async () => new Map(),   // 永远拿不到完整 Cookie
+        pollIntervalMs: 5, scanTimeoutMs: 60000,
+        setTimer: (fn, ms) => setTimeout(fn, ms),
+        clearTimer: (t) => clearTimeout(t),
+        now: () => Date.now(),
+      });
+      await am.beginLogin();
+      await am.cancelLogin('用户关闭了登录窗口');
+      ok('G17', '反向确认:未登录成功时关窗确实会清理 Session',
+        rec2.cleared > 0, 'cleared=' + rec2.cleared);
+    }
   }
 
 
