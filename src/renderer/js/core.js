@@ -12,12 +12,20 @@ document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.add('active');
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     $('page-' + el.dataset.page).classList.add('active');
-    if (el.dataset.page === 'history') loadHistory();
-    if (el.dataset.page === 'favorites') loadFavorites();
-    if (el.dataset.page === 'services') { loadServices(); refreshDoubao(); }
-    if (el.dataset.page === 'ai') loadPresets();
+    // 六页各自的进入时加载(阶段4 UI 重构:页面 id 变更,加载逻辑等价迁移)
+    if (el.dataset.page === 'library') { loadHistory(); loadFavorites(); }
+    if (el.dataset.page === 'plugins') { loadServices(); refreshDoubao(); loadPluginList(); }
+    if (el.dataset.page === 'creation') loadPresets();
   });
 });
+
+// 图片库页内 tab(历史/收藏)。收藏变化后由 loadFavorites 主动刷新,无需监听。
+function switchLibTab(tab) {
+  document.querySelectorAll('#lib-seg button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $('lib-history').style.display = tab === 'history' ? '' : 'none';
+  $('lib-favorites').style.display = tab === 'favorites' ? '' : 'none';
+  if (tab === 'history') loadHistory(); else loadFavorites();
+}
 
 // ---------- 事件委托(阶段2:替代内联 onclick/onchange,以便启用 CSP) ----------
 // 原先 index.html 里有 38 处内联事件(29 onclick + 9 onchange),内联处理器无法与
@@ -37,6 +45,7 @@ const CLICK_ACTIONS = {
   'add-tag': () => addTag(),
   'run-assist': () => runAssist(),
   'ai-now': () => aiNow(),
+  'lib-tab': (el) => switchLibTab(el.dataset.tab),
   // 阶段4 生成预览流
   'ai-apply-now': () => aiApplyNow(),
   'ai-regen': () => aiRegen(),
@@ -86,6 +95,15 @@ const CHANGE_SETTERS = {
   str: (el) => saveStr(el.dataset.key, el.value),
   num: (el) => saveNum(el.dataset.key, el.value),
 };
+
+// Enter 键委托(阶段4 UI 重构):替代 2 处内联 onkeydown,与 data-act 映射表对接
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  const el = ev.target.closest('[data-enter]');
+  if (!el) return;
+  const fn = CLICK_ACTIONS[el.dataset.enter];
+  if (fn) { ev.preventDefault(); fn(el); }
+});
 
 document.addEventListener('click', (ev) => {
   const el = ev.target.closest('[data-act]');

@@ -18,7 +18,7 @@ async function aiNow() {
     const ds = await api.doubao.status();
     if (!ds || ds.state !== 'authenticated') {
       toast('豆包未登录:请到「API 服务」页的豆包卡片扫码登录', 5000);
-      document.querySelector('.nav-item[data-page="services"]').click();
+      document.querySelector('.nav-item[data-page="plugins"]').click();
       return;
     }
   } else {
@@ -27,7 +27,7 @@ async function aiNow() {
     const hasImage = services.some(s => s.kind === 'image');
     if (!hasImage) {
       toast('请先到「API 服务」页添加画图 API(需支持 /v1/images/generations)', 5000);
-      document.querySelector('.nav-item[data-page="services"]').click();
+      document.querySelector('.nav-item[data-page="plugins"]').click();
       return;
     }
   }

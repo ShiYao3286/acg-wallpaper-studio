@@ -34,6 +34,7 @@
 <symbol id="i-folder" viewBox="0 0 24 24"><path fill="currentColor" d="M3 5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
 <symbol id="i-sparkle" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2l1.8 5.6L19.5 9l-5.7 1.4L12 16l-1.8-5.6L4.5 9l5.7-1.4zM19 13l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9zM5 14l.7 2.3 2.3.7-2.3.7L5 20l-.7-2.3L2 17l2.3-.7z"/></symbol>
 <symbol id="i-trash" viewBox="0 0 24 24"><path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4zM5 8h14l-1 13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1z"/></symbol>
+<symbol id="i-puzzle" viewBox="0 0 24 24"><path fill="currentColor" d="M20.5 11H19V7a2 2 0 0 0-2-2h-4V3.5A2.5 2.5 0 0 0 10.5 1 2.5 2.5 0 0 0 8 3.5V5H4a2 2 0 0 0-2 2v3.8h1.5A2.7 2.7 0 0 1 6.2 13.5 2.7 2.7 0 0 1 3.5 16.2H2V20a2 2 0 0 0 2 2h3.8v-1.5a2.7 2.7 0 0 1 2.7-2.7 2.7 2.7 0 0 1 2.7 2.7V22H17a2 2 0 0 0 2-2v-4h1.5a2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-2.5-2.5z"/></symbol>
 <symbol id="i-plus" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" d="M12 5v14M5 12h14"/></symbol>
 <symbol id="i-check" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" d="m4 12.5 5.5 5.5L20 6.5"/></symbol>
 <symbol id="i-zap" viewBox="0 0 24 24"><path fill="currentColor" d="M13 2 3 14h7l-1 8 10-12h-7z"/></symbol>
@@ -58,20 +59,21 @@
       <img src="../../assets/icon.png">
       <div><b>ACG壁纸</b><span>工作台</span></div>
     </div>
-    <div class="nav-item active" data-page="home"><svg><use href="#i-home"/></svg>主页</div>
-    <div class="nav-item" data-page="tags"><svg><use href="#i-tag"/></svg>标签池</div>
-    <div class="nav-item" data-page="ai"><svg><use href="#i-bot"/></svg>AI 生图</div>
-    <div class="nav-item" data-page="history"><svg><use href="#i-img"/></svg>历史壁纸</div>
-    <div class="nav-item" data-page="favorites"><svg><use href="#i-heart"/></svg>收藏夹</div>
-    <div class="nav-item" data-page="services"><svg><use href="#i-plug"/></svg>API 服务</div>
+    <div class="nav-item active" data-page="workbench"><svg><use href="#i-home"/></svg>工作台</div>
+    <div class="nav-item" data-page="creation"><svg><use href="#i-bot"/></svg>AI 创作</div>
+    <div class="nav-item" data-page="library"><svg><use href="#i-img"/></svg>图片库</div>
+    <div class="nav-item" data-page="desktop"><svg><use href="#i-zap"/></svg>桌面管理</div>
+    <div class="nav-item" data-page="plugins"><svg><use href="#i-plug"/></svg>插件中心</div>
     <div class="nav-item" data-page="settings"><svg><use href="#i-gear"/></svg>设置</div>
     <div class="side-bottom">Keep your desktop fresh ✨</div>
   </div>
 
   <div id="main">
 
-    <div class="page active" id="page-home">
+    <div class="page active" id="page-workbench">
+      <h2><svg><use href="#i-home"/></svg>工作台</h2>
       <div class="home-grid">
+
         <div class="hero-card">
           <img id="preview" src="">
           <div class="hero-actions">
@@ -84,19 +86,7 @@
           <div class="hero-dots"><i></i><i></i><i></i><i></i></div>
         </div>
         <div class="side-col">
-          <div class="card">
-            <div style="font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:7px"><svg style="width:15px;height:15px"><use href="#i-zap"/></svg>快速设置</div>
-            <div class="field"><span>自动换图</span><div class="switch on" id="sw-schedule" data-act="toggle" data-key="schedule.enabled"></div></div>
-            <div class="field"><span>间隔(分钟)</span>
-              <div class="stepper">
-                <button data-act="step-interval" data-delta="-5">−</button>
-                <input type="number" id="interval" min="5" max="720" data-set="num" data-key="schedule.intervalMinutes">
-                <button data-act="step-interval" data-delta="5">+</button>
-              </div>
-            </div>
-            <div class="field"><span>游戏时暂停</span><div class="switch on" id="sw-game" data-act="toggle" data-key="gameCheck.enabled"></div></div>
-          </div>
-          <div class="card">
+<div class="card">
             <div style="font-weight:600;margin-bottom:8px">壁纸来源</div>
             <div class="seg" id="source-seg">
               <button id="seg-lolicon" class="on" data-act="set-source" data-src="lolicon">二次元图</button>
@@ -104,21 +94,21 @@
             </div>
             <p class="hint" style="margin-top:8px">定时换图使用此来源;也可单独点下方按钮。</p>
           </div>
-          <div class="btn-col">
+<div class="btn-col">
             <button class="btn" id="btn-change" data-act="change-now"><svg><use href="#i-refresh"/></svg>立即换一张</button>
             <button class="btn ghost" data-act="open-folder"><svg><use href="#i-folder"/></svg>打开壁纸文件夹</button>
           </div>
         </div>
+        </div>
       </div>
-    </div>
-
-    <div class="page" id="page-tags">
+      <div class="card" style="margin-top:14px">
+        <div style="font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:7px"><svg style="width:15px;height:15px"><use href="#i-tag"/></svg>标签池(Lolicon 题材)</div>
       <h2><svg><use href="#i-tag"/></svg>标签池</h2>
       <div class="card">
         <p class="hint">每次换图从下列标签随机抽取一个,向 Lolicon API 请求对应题材。点击 × 删除,输入后回车或点添加。</p>
         <div id="tag-list" style="margin-top:10px"></div>
         <div class="row" style="margin-top:12px">
-          <input type="text" id="tag-input" placeholder="输入 Pixiv 标签,如:Arknights" style="width:230px" onkeydown="if(event.key==='Enter')addTag()">
+          <input type="text" id="tag-input" placeholder="输入 Pixiv 标签,如:Arknights" style="width:230px" data-enter="add-tag">
           <button class="btn small" data-act="add-tag"><svg><use href="#i-plus"/></svg>添加</button>
         </div>
       </div>
@@ -138,8 +128,8 @@
       </div>
     </div>
 
-    <div class="page" id="page-ai">
-      <h2><svg><use href="#i-bot"/></svg>AI 生图壁纸</h2>
+<div class="page" id="page-creation">
+      <h2><svg><use href="#i-bot"/></svg>AI 创作</h2>
       <div class="card">
         <div class="mode-grid">
           <div class="mode-card on" id="mode-any" data-act="set-mode" data-mode="any">
@@ -176,7 +166,7 @@
               <span class="hint" style="margin:0" id="assist-engine"></span>
             </div>
             <div class="row" style="margin:0">
-              <input type="text" id="assist-theme" placeholder="主题,如:雪地里的初音未来 / 星空下的古城" style="flex:1" onkeydown="if(event.key==='Enter')runAssist()">
+              <input type="text" id="assist-theme" placeholder="主题,如:雪地里的初音未来 / 星空下的古城" style="flex:1" data-enter="run-assist">
               <button class="btn small" id="btn-assist" data-act="run-assist"><svg><use href="#i-sparkle"/></svg>生成提示词</button>
             </div>
           </div>
@@ -214,18 +204,52 @@
       </div>
     </div>
 
-    <div class="page" id="page-history">
-      <h2><svg><use href="#i-img"/></svg>历史壁纸</h2>
-      <div class="card"><div class="gallery" id="gallery"></div></div>
+    <div class="page" id="page-library">
+      <h2><svg><use href="#i-img"/></svg>图片库</h2>
+      <div class="seg" id="lib-seg" style="margin-bottom:12px">
+        <button class="on" data-act="lib-tab" data-tab="history">历史壁纸</button>
+        <button data-act="lib-tab" data-tab="favorites">收藏夹</button>
+      </div>
+      <div id="lib-history">
+<div class="card"><div class="gallery" id="gallery"></div></div>
+      </div>
+      <div id="lib-favorites" style="display:none">
+<div class="card"><div class="gallery" id="fav-gallery"></div></div>
+      </div>
     </div>
 
-    <div class="page" id="page-favorites">
-      <h2><svg><use href="#i-heart"/></svg>收藏夹</h2>
-      <div class="card"><div class="gallery" id="fav-gallery"></div></div>
+    <div class="page" id="page-desktop">
+      <h2><svg><use href="#i-zap"/></svg>桌面管理</h2>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:4px">定时换图</div>
+<div style="font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:7px"><svg style="width:15px;height:15px"><use href="#i-zap"/></svg>快速设置</div>
+            <div class="field"><span>自动换图</span><div class="switch on" id="sw-schedule" data-act="toggle" data-key="schedule.enabled"></div></div>
+            <div class="field"><span>间隔(分钟)</span>
+              <div class="stepper">
+                <button data-act="step-interval" data-delta="-5">−</button>
+                <input type="number" id="interval" min="5" max="720" data-set="num" data-key="schedule.intervalMinutes">
+                <button data-act="step-interval" data-delta="5">+</button>
+              </div>
+            </div>
+            <div class="field"><span>游戏时暂停</span><div class="switch on" id="sw-game" data-act="toggle" data-key="gameCheck.enabled"></div></div>
+      </div>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:4px">游戏检测</div>
+<div class="field"><span>游戏进程名单</span></div>
+        <textarea id="game-procs" style="width:100%;min-height:64px" data-set="game-procs"></textarea>
+        <p class="hint">每行一个进程名(不含 .exe),如 WardogsClient-Win64-Shipping</p>
+      </div>
+      </div>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:4px">旧计划任务</div>
+<div class="field"><span>旧计划任务</span><button class="btn danger small" data-act="disable-old-task">停用 ACG-Wallpaper-Auto</button>
+          <span class="hint" id="old-task-status"></span></div>
+        <p class="hint">本软件自带定时换图,旧计划任务需停用,避免双重换图冲突。</p>
+      </div>
     </div>
 
-    <div class="page" id="page-services">
-      <h2><svg><use href="#i-plug"/></svg>API 服务</h2>
+<div class="page" id="page-plugins">
+      <h2><svg><use href="#i-plug"/></svg>插件中心</h2>
 
       <!-- 豆包账号(阶段3) -->
       <div class="card" id="doubao-card">
@@ -269,6 +293,11 @@
           <button class="btn small" data-act="new-service"><svg><use href="#i-plus"/></svg>添加服务</button>
         </div>
       </div>
+      <div class="card" id="plugins-card">
+        <div style="font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:7px"><svg style="width:15px;height:15px"><use href="#i-puzzle"/></svg>插件</div>
+        <p class="hint">内置 Provider 与外部插件。<b>启用外部插件 = 信任并执行其全部代码</b>(主进程内运行,无沙箱隔离)。</p>
+        <div id="plugin-list" style="margin-top:10px"></div>
+      </div>
       <div class="card" id="svc-editor" style="display:none">
         <div style="font-weight:600;margin-bottom:10px" id="svc-editor-title">编辑服务</div>
         <div class="field"><span>名称</span><input type="text" id="svc-name" style="flex:1" placeholder="如:我的生图 API"></div>
@@ -292,24 +321,17 @@
     <div class="page" id="page-settings">
       <h2><svg><use href="#i-gear"/></svg>设置</h2>
       <div class="card">
+<div class="card">
         <div class="field"><span>开机自动启动</span><div class="switch" id="sw-autorun" data-act="toggle-autorun"></div></div>
         <div class="field"><span>历史保留数量</span><input type="number" id="hist-keep" min="3" max="200" style="width:80px" data-set="num" data-key="history.keepCount"> <span style="color:var(--sub);font-size:12px">张</span></div>
-        <div class="field"><span>游戏进程名单</span></div>
-        <textarea id="game-procs" style="width:100%;min-height:64px" data-set="game-procs"></textarea>
-        <p class="hint">每行一个进程名(不含 .exe),如 WardogsClient-Win64-Shipping</p>
       </div>
       <div class="card">
-        <div style="font-weight:600;margin-bottom:4px">🌐 网络代理</div>
+<div style="font-weight:600;margin-bottom:4px">🌐 网络代理</div>
         <p class="hint">访问 Lolicon / AI API 走此代理(需代理软件的 HTTP 端口,如 Clash Verge 的 7897)。本机服务(127.0.0.1 网关)不受影响。</p>
         <div class="field"><span>启用代理</span><div class="switch" id="sw-proxy" data-act="toggle" data-key="proxy.enabled"></div></div>
         <div class="field"><span>代理地址</span><input type="text" id="proxy-url" style="flex:1" placeholder="http://127.0.0.1:7897" data-set="str" data-key="proxy.url">
           <button class="btn small ghost" data-act="detect-proxy"><svg><use href="#i-refresh"/></svg>自动探测</button></div>
         <div class="svc-test-result" id="proxy-detect-result"></div>
-      </div>
-      <div class="card">
-        <div class="field"><span>旧计划任务</span><button class="btn danger small" data-act="disable-old-task">停用 ACG-Wallpaper-Auto</button>
-          <span class="hint" id="old-task-status"></span></div>
-        <p class="hint">本软件自带定时换图,旧计划任务需停用,避免双重换图冲突。</p>
       </div>
     </div>
 

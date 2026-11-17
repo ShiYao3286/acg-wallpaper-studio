@@ -239,3 +239,70 @@ async function onAiModelChange() {
 }
 
 // ---------- 状态栏 ----------
+
+
+// ---------- 插件中心:插件列表(阶段4 UI 重构批2,渲染逻辑;启停见下方按钮委托) ----------
+// 使用既有 IPC:api.listPlugins()(阶段2 已暴露,返回 { builtin, external, skipped })。
+// 安全模型(方案 12.8.5):启用 = 信任并执行外部插件全部代码,UI 必须把这点讲清楚。
+async function loadPluginList() {
+  const box = $('plugin-list');
+  if (!box) return;
+  box.textContent = '';
+  let data;
+  try { data = await api.listPlugins(); } catch (e) {
+    setEmptyTip(box, '插件列表加载失败: ' + (e && e.message || e));
+    return;
+  }
+  const all = [].concat(
+    (data.builtin || []).map(p => ({ ...p, __group: 'builtin' })),
+    (data.external || []).map(p => ({ ...p, __group: 'external' })),
+  );
+  if (!all.length) { setEmptyTip(box, '没有已注册的插件'); return; }
+  for (const p of all) {
+    const row = document.createElement('div');
+    row.className = 'svc-card';
+    const head = document.createElement('div');
+    head.className = 'svc-head';
+    const name = document.createElement('b');
+    name.className = 'svc-name';
+    name.textContent = p.name || p.id;
+    const kind = document.createElement('span');
+    kind.className = 'svc-kind';
+    kind.textContent = p.builtin ? '内置' : '外部';
+    kind.style.background = p.builtin ? 'linear-gradient(135deg,#64748b,#475569)' : 'linear-gradient(135deg,#f59e0b,#d97706)';
+    const badge = document.createElement('span');
+    badge.className = 'active-badge';
+    badge.style.opacity = p.enabled ? '1' : '0.45';
+    badge.textContent = p.enabled ? '已启用' : '已停用';
+    const actions = document.createElement('div');
+    actions.className = 'svc-actions';
+    const btn = document.createElement('button');
+    btn.className = 'btn small ' + (p.enabled ? 'ghost' : '');
+    btn.textContent = p.enabled ? '停用' : '启用';
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        if (!p.builtin && !p.enabled) {
+          if (!confirm('启用外部插件「' + (p.name || p.id) + '」?\n\n启用等于信任并执行该插件的全部代码(主进程内运行,无沙箱)。')) return;
+        }
+        const r = await api.setPluginEnabled(p.id, !p.enabled);
+        if (r && r.ok === false) { toast('操作失败: ' + (r.error || '未知错误'), 4000); return; }
+        toast((!p.enabled ? '已启用 ' : '已停用 ') + (p.name || p.id));
+        loadPluginList();
+      } finally { btn.disabled = false; }
+    });
+    actions.appendChild(btn);
+    head.appendChild(name); head.appendChild(kind); head.appendChild(badge); head.appendChild(actions);
+    const meta = document.createElement('div');
+    meta.className = 'svc-model';
+    meta.textContent = 'v' + (p.version || '?') + ' · ' + (p.kind || '(未声明)') + ' · ' + (p.capabilities || []).join(', ');
+    row.appendChild(head); row.appendChild(meta);
+    box.appendChild(row);
+  }
+  if ((data.skipped || []).length) {
+    const tip = document.createElement('p');
+    tip.className = 'hint';
+    tip.textContent = '以下插件目录被跳过: ' + data.skipped.map(s => s.dir + '(' + s.reason + ')').join('; ');
+    box.appendChild(tip);
+  }
+}
