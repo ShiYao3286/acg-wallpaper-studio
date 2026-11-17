@@ -13,7 +13,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const fsp = fs.promises;
 const { stripBom } = require('../../shared/text');
-const { ok, failFrom, ERROR_CODES } = require('../../shared/contracts');
+const { ok, fail, failFrom, ERROR_CODES } = require('../../shared/contracts');
 
 // 注入的依赖(全部由 main.js 在 init 时提供)
 let deps = {

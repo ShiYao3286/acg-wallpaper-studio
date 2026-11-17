@@ -193,6 +193,47 @@ async function seedImageService(call, svcId) {
     closeAllWatchers();
   }
 
+  group('G apply 与换图互斥(并发防线)');
+  {
+    const env = await mkEnv();
+    setWallpaperBehavior(undefined);
+    await seedImageService(env.call, 'svc-img-6');
+    // 生成 pending
+    const stub = stubImageFetch(JPEG);
+    let g;
+    try { g = await env.call('ai-generate'); } finally { stub.restore(); }
+
+    // 持锁:change-wallpaper(ai) 获取 changing 互斥后,把 fetch 挂起(可控 deferred)
+    let releaseFetch = null;
+    const orig = globalThis.fetch;
+    globalThis.fetch = () => new Promise(res => { releaseFetch = () => res({ ok: true, status: 200,
+      json: () => Promise.resolve({ data: [{ b64_json: JPEG.toString('base64') }] }),
+      text: () => Promise.resolve(''), arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)) }); });
+    let cwDone = false, cwErr = null;
+    const cwPromise = env.call('change-wallpaper', 'ai').then(r => { cwDone = true; return r; }).catch(e => { cwErr = e; });
+    // 轮询等待锁被获取且 fetch 进入挂起(不假设固定时延)
+    for (let i = 0; i < 100 && typeof releaseFetch !== 'function'; i++) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+    ok('G0', '换图请求已进入挂起的 fetch(时序自证)', typeof releaseFetch === 'function', '');
+
+    // 并发 apply:必须被互斥拒绝,不能进入事务
+    const a = await env.call('ai-apply', g.taskId);
+    ok('G1', '换图进行中时 ai-apply 被互斥拒绝(E_STATE)', a && a.ok === false && a.code === 'E_STATE' && /正在换图/.test(String(a.error || '')),
+      JSON.stringify({ ok: a && a.ok, code: a && a.code, err: a && a.error }).slice(0, 140));
+
+    // 放行换图并等待完成
+    releaseFetch();
+    const cw = await cwPromise;
+    globalThis.fetch = orig;
+    ok('G2', '挂起的换图最终成功(测试自证)', cw && cw.ok === true && !cwErr, JSON.stringify({ ok: cw && cw.ok, err: cw && cw.error }).slice(0, 100));
+    // 换图直应用路径消耗了 pending 吗?不会——它走 changeWallpaper 取图,pending 未被触碰。
+    // 因此 pending 仍可被正常应用(此时锁已释放)
+    const a2 = await env.call('ai-apply', g.taskId);
+    ok('G3', '锁释放后同一 pending 可正常应用', a2 && a2.ok === true, JSON.stringify({ ok: a2 && a2.ok, err: a2 && a2.error }).slice(0, 120));
+    closeAllWatchers();
+  }
+
   const sum = summarize();
   console.log('---- 第二十四部分小结: ' + sum.passed + '/' + sum.total + ' 通过, ' + sum.failed + ' 失败' + (sum.skipped ? ', ' + sum.skipped + ' 跳过' : ''));
   cleanupTmp();
