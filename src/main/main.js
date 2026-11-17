@@ -844,7 +844,10 @@ ipcMain.handle('ai-generate', async (e, rawPrompt) => {
     taskService.stepTask(id, 'save-pending', 'done');
     taskService.endTask(id, true);
     const st = await readPendingState();
+    // pendingPath:渲染层预览图要用 file:// 直读。路径属于本应用自己的 userData,
+    // 不含用户敏感数据;渲染层无法用它触达 pending 之外的任何文件(应用/放弃仍以 taskId 为准)。
     return ok({ taskId: id, prompt: finalPrompt, bytes: buf.length, imageVersion: st.imageVersion,
+      pendingPath: pendingDir(),
       engine: (cfg.ai && cfg.ai.imageEngine) || 'service' });
   } catch (err) {
     taskService.endTask(id, false, (err && err.message) || String(err));
@@ -906,6 +909,7 @@ ipcMain.handle('ai-pending-get', async () => {
   }
   return ok({ exists: true, imageVersion: st.imageVersion, bytes: st.bytes,
     prompt: st.prompt, createdAt: st.createdAt, taskId: meta.taskId || '',
+    pendingPath: pendingDir(),
     engine: meta.engine || 'service', randomMode: meta.randomMode || '' });
 });
 // 只读通道的失败记录(阶段2 第5步)

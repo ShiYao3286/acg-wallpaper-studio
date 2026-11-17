@@ -357,9 +357,24 @@ textarea { resize:vertical; }
           <select id="ai-size" data-set="str" data-key="ai.size">
             <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
           </select>
+          <span style="color:var(--sub);font-size:13px">生成预览</span>
+          <div class="switch" id="sw-preview" data-act="toggle" data-key="ai.previewMode" title="开启后生成先出预览图,确认后再应用"></div>
           <button class="btn" id="btn-ai" style="margin-left:auto" data-act="ai-now"><svg><use href="#i-sparkle"/></svg>用 AI 生成壁纸</button>
         </div>
-        <p class="hint" style="margin-top:8px">生成约需 20~60 秒,生成完成自动设为壁纸并写入历史。</p>
+        <p class="hint" style="margin-top:8px">生成约需 20~60 秒。默认生成后直接应用壁纸;开启「生成预览」后先出预览图,确认满意再应用。</p>
+      </div>
+      <div class="card" id="ai-preview-card" style="display:none">
+        <div class="row" style="margin:0 0 10px">
+          <span style="font-weight:600">生成结果预览</span>
+          <span class="hint" id="ai-preview-meta" style="margin:0"></span>
+        </div>
+        <img id="ai-preview-img" alt="生成结果预览" style="width:100%;max-height:340px;object-fit:contain;border-radius:8px;background:#0d0f14">
+        <div class="row" style="margin-top:12px">
+          <button class="btn" id="btn-apply" data-act="ai-apply-now"><svg><use href="#i-check"/></svg>应用为壁纸</button>
+          <button class="btn" id="btn-regen" data-act="ai-regen" style="margin-left:8px"><svg><use href="#i-refresh"/></svg>重新生成</button>
+          <button class="btn" id="btn-discard" data-act="ai-discard-now" style="margin-left:auto">放弃</button>
+        </div>
+        <p class="hint" style="margin-top:8px">重新生成会消耗一次生成额度;放弃不消耗。</p>
       </div>
     </div>
 

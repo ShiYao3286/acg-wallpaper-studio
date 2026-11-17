@@ -60,8 +60,13 @@ async function seedImageService(call, svcId) {
       'setWallpaper 调用数=' + wallpaperCalls().length);
     ok('A4', '出网仅限生图 API(单次 fetch)', stub.count() === 1, 'fetch 次数=' + stub.count());
     const pg = await env.call('ai-pending-get');
-    ok('A5', 'ai-pending-get 返回存在态+元数据(无绝对路径)', pg && pg.ok && pg.exists === true && pg.prompt === '测试提示词 A' && pg.taskId === r.taskId && !/\\/.test(JSON.stringify(pg)),
-      JSON.stringify(pg).slice(0, 180));
+    // 阶段4 批3:pengPath 有意回传(渲染层 file:// 预览需要)。断言升级:
+    // pendingPath 必须精确等于 userData/pending(不越界),且响应不含任何敏感字段。
+    ok('A5', 'ai-pending-get 返回存在态+元数据,pendingPath 限于 userData/pending',
+      pg && pg.ok && pg.exists === true && pg.prompt === '测试提示词 A' && pg.taskId === r.taskId
+      && pg.pendingPath === env.pendingDir
+      && !/apikey|apikey|cookie|token|credential/i.test(JSON.stringify(pg)),
+      JSON.stringify(pg).slice(0, 200));
     const st = await env.call('get-status');
     ok('A6', 'get-status 透出 task 快照与 pending 摘要', st.task && st.task.current === null && st.task.recent.length === 1 && st.pending && st.pending.exists === true,
       JSON.stringify({ recent: st.task && st.task.recent.length, pending: st.pending && st.pending.exists }));
