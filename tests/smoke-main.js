@@ -45,4 +45,4 @@ stub.listen(18091, '127.0.0.1', () => console.log('[SMOKE] stub ready on 18091')
 console.log('[SMOKE] tmpRoot =', tmpRoot);
 console.log('[SMOKE] boot real main.js ...');
 // 真实 main.js(其内部 app.whenReady 会正常走 createWindow 等)
-require('./src/main/main.js');
+require('../src/main/main.js');

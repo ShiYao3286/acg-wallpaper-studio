@@ -12,10 +12,10 @@
        - 网络:renderer 不做任何 fetch/XHR/WebSocket(全部走 IPC),故 connect-src 'none'
        - 框架/插件/表单:一律不支持,显式写 none 而非留空 -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' file: data:; font-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
-<link rel="stylesheet" href="styles/base.css">
-<link rel="stylesheet" href="styles/layout.css">
-<link rel="stylesheet" href="styles/components.css">
-<link rel="stylesheet" href="styles/pages.css">
+<link rel="stylesheet" href="styles/base.css?v=20261117b">
+<link rel="stylesheet" href="styles/layout.css?v=20261117b">
+<link rel="stylesheet" href="styles/components.css?v=20261117b">
+<link rel="stylesheet" href="styles/pages.css?v=20261117b">
 </head>
 <body>
 <div class="glow g1"></div><div class="glow g2"></div>
@@ -340,17 +340,17 @@
 
 <div id="statusbar"><span class="dot"></span><span id="status-text">就绪</span><span class="right" id="status-right"></span></div>
 <div id="toast"></div>
-<script src="js/core.js"></script>
-<script src="js/ui.js"></script>
-<script src="js/doubao.js"></script>
-<script src="js/tags.js"></script>
-<script src="js/settings-shared.js"></script>
-<script src="js/services.js"></script>
-<script src="js/library.js"></script>
-<script src="js/creation.js"></script>
-<script src="js/workbench.js"></script>
-<script src="js/config.js"></script>
-<script src="js/status.js"></script>
-<script src="js/boot.js"></script>
+<script src="js/core.js?v=20261117b"></script>
+<script src="js/ui.js?v=20261117b"></script>
+<script src="js/doubao.js?v=20261117b"></script>
+<script src="js/tags.js?v=20261117b"></script>
+<script src="js/settings-shared.js?v=20261117b"></script>
+<script src="js/pages/services.js?v=20261117b"></script>
+<script src="js/pages/library.js?v=20261117b"></script>
+<script src="js/pages/creation.js?v=20261117b"></script>
+<script src="js/pages/workbench.js?v=20261117b"></script>
+<script src="js/config.js?v=20261117b"></script>
+<script src="js/status.js?v=20261117b"></script>
+<script src="js/boot.js?v=20261117b"></script>
 </body>
 </html>
