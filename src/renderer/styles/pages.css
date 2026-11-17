@@ -1,0 +1,70 @@
+/* pages.css:页面级布局(home-grid/hero/stepper/tag/gallery/mode/prompt/svc/预设)。自 index.html <style> 迁出,内容未改。 */
+.btn-col { display:flex; flex-direction:column; gap:9px; }
+.btn-col .btn { width:100%; justify-content:center; }
+
+.stepper { display:flex; align-items:center; border:1px solid var(--line); border-radius:10px; overflow:hidden; background:rgba(0,0,0,0.28); }
+.stepper button { width:30px; height:32px; border:none; background:transparent; color:var(--sub); cursor:pointer; font-size:15px; }
+.stepper button:hover { background:var(--glass2); color:#fff; }
+.stepper input { width:46px; border:none; background:transparent; text-align:center; padding:6px 0; border-radius:0; }
+
+.tag-chip { display:inline-flex; align-items:center; gap:7px; padding:7px 14px; border-radius:18px; font-size:13px; margin:5px; color:#fff; box-shadow:0 3px 10px rgba(0,0,0,0.25); }
+.tag-chip .x { cursor:pointer; opacity:0.75; } .tag-chip .x:hover { opacity:1; }
+.c0{background:linear-gradient(135deg,#8b5cf6,#6d28d9)} .c1{background:linear-gradient(135deg,#ec4899,#be185d)}
+.c2{background:linear-gradient(135deg,#f59e0b,#d97706)} .c3{background:linear-gradient(135deg,#10b981,#059669)}
+.c4{background:linear-gradient(135deg,#3b82f6,#2563eb)} .c5{background:linear-gradient(135deg,#f43f5e,#e11d48)}
+
+.gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:12px; }
+.gitem { position:relative; border-radius:13px; overflow:hidden; border:1px solid var(--line); cursor:pointer; transition:all .18s; aspect-ratio:16/10; background:rgba(0,0,0,0.3); }
+.gitem img { width:100%; height:100%; object-fit:cover; display:block; }
+.gitem:hover { transform:translateY(-3px); border-color:var(--accent); box-shadow:0 8px 22px rgba(139,92,246,0.35); }
+.gact { position:absolute; inset:auto 8px 8px 8px; padding:7px 0; text-align:center; font-size:12px; border:none; border-radius:9px; background:var(--grad); color:#fff; cursor:pointer; opacity:0; transition:all .18s; font-weight:600; }
+.gitem:hover .gact { opacity:1; }
+.gdel { position:absolute; top:8px; right:8px; width:28px; height:28px; border-radius:8px; border:none; background:rgba(220,38,38,0.85); color:#fff; cursor:pointer; opacity:0; transition:.18s; display:flex; align-items:center; justify-content:center; }
+.gdel svg { width:14px; height:14px; }
+.gitem:hover .gdel { opacity:1; }
+.gname { position:absolute; top:0; left:0; right:0; padding:16px 10px 22px; font-size:11px; color:#fff; background:linear-gradient(rgba(10,8,20,0.75),transparent); opacity:0; transition:.18s; pointer-events:none; }
+.gitem:hover .gname { opacity:1; }
+
+/* AI 生成模式卡 */
+.mode-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:9px; margin-bottom:10px; }
+.mode-card {
+  border:1px solid var(--line); border-radius:13px; padding:12px 6px 10px; text-align:center;
+  cursor:pointer; transition:all .18s; background:rgba(0,0,0,0.22); color:var(--sub);
+}
+.mode-card svg { width:20px; height:20px; display:block; margin:0 auto 6px; }
+.mode-card b { display:block; font-size:13px; color:var(--text); font-weight:600; margin-bottom:3px; }
+.mode-card span { font-size:10.5px; line-height:1.4; display:block; opacity:0.85; }
+.mode-card:hover { border-color:var(--accent); background:var(--glass2); transform:translateY(-2px); }
+.mode-card.on { border-color:transparent; background:var(--grad); box-shadow:0 4px 16px rgba(139,92,246,0.45); }
+.mode-card.on b, .mode-card.on span { color:#fff; opacity:1; }
+.prompt-box {
+  position:relative; background:rgba(0,0,0,0.30); border:1px solid var(--line);
+  border-radius:12px; padding:12px 46px 12px 14px; min-height:64px;
+}
+.prompt-box::before { content:''; position:absolute; left:0; top:10px; bottom:10px; width:3px; border-radius:2px; background:var(--grad); }
+.prompt-box code { font-family:Consolas,monospace; font-size:12px; color:#c9c2e8; line-height:1.7; word-break:break-all; display:block; }
+.prompt-box .reroll {
+  position:absolute; top:8px; right:8px; width:32px; height:32px; border-radius:9px;
+  border:1px solid var(--line); background:var(--glass); color:var(--sub); cursor:pointer;
+  display:flex; align-items:center; justify-content:center; transition:all .18s;
+}
+.prompt-box .reroll svg { width:15px; height:15px; }
+.prompt-box .reroll:hover { color:#fff; background:var(--grad); border-color:transparent; }
+.prompt-box .reroll.spinning svg { animation:spin 0.7s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.assist-inline { margin-top:12px; border-top:1px dashed var(--line); padding-top:12px; }
+
+/* API 服务卡片 */
+.svc-card { border:1px solid var(--line); border-radius:14px; padding:14px 16px; margin-bottom:12px; background:rgba(0,0,0,0.22); }
+.svc-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.svc-kind { font-size:11px; padding:3px 10px; border-radius:12px; font-weight:600; }
+.svc-kind.image { background:linear-gradient(135deg,#8b5cf6,#6d28d9); }
+.svc-kind.text { background:linear-gradient(135deg,#10b981,#059669); }
+.svc-name { font-weight:600; font-size:14px; }
+.svc-model { color:var(--sub); font-size:12px; }
+.svc-actions { margin-left:auto; display:flex; gap:7px; }
+.svc-test-result { font-size:12px; margin-top:6px; color:var(--sub); line-height:1.6; }
+.active-badge { font-size:11px; color:#10b981; border:1px solid rgba(16,185,129,0.4); padding:2px 9px; border-radius:10px; }
+.preset-slot { display:inline-flex; align-items:center; gap:6px; padding:7px 13px; border-radius:11px; border:1px solid var(--line); background:rgba(0,0,0,0.25); font-size:12.5px; cursor:pointer; transition:.18s; color:var(--text); }
+.preset-slot:hover { border-color:var(--accent); background:var(--glass2); }
+.preset-slot svg { width:13px; height:13px; }

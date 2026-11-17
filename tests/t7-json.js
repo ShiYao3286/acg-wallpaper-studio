@@ -153,7 +153,12 @@ const readLines = (p) => fs.readFileSync(p, 'utf8').split('\n');
     const files = [
       'src/main/main.js', 'src/main/preload.js', 'src/main/validate.js',
       'src/shared/text.js', 'src/shared/contracts.js', 'src/shared/defaults.js',
-      'src/renderer/renderer.js',
+      // 阶段4 UI 重构:renderer.js 拆分为 12 个 js/ 文件,逐个做语法核验
+      'src/renderer/js/core.js', 'src/renderer/js/ui.js', 'src/renderer/js/doubao.js',
+      'src/renderer/js/tags.js', 'src/renderer/js/settings-shared.js',
+      'src/renderer/js/pages/services.js', 'src/renderer/js/pages/library.js',
+      'src/renderer/js/pages/creation.js', 'src/renderer/js/pages/workbench.js',
+      'src/renderer/js/config.js', 'src/renderer/js/status.js', 'src/renderer/js/boot.js',
     ];
     for (const f of files) {
       let pass, msg;

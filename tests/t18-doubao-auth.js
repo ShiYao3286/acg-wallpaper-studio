@@ -513,7 +513,12 @@ function mkSafe(o) {
   group('I 重启恢复后的操作区可见性');
   {
     const vm = require('node:vm');
-    const rSrc = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'renderer.js'), 'utf8');
+    // 阶段4 UI 重构:renderer.js 拆分为 js/ 多文件,这里拼接全文(顺序与运行时一致)
+const RJS_ORDER = [['core.js','js'],['ui.js','js'],['doubao.js','js'],['tags.js','js'],
+  ['settings-shared.js','js'],['services.js','js/pages'],['library.js','js/pages'],
+  ['creation.js','js/pages'],['workbench.js','js/pages'],['config.js','js'],
+  ['status.js','js'],['boot.js','js']];
+const rSrc = RJS_ORDER.map(([f, d]) => fs.readFileSync(path.join(ROOT, 'src', 'renderer', d, f), 'utf8')).join('\n');
 
     function extractFn(name) {
       const start = rSrc.indexOf('function ' + name + '(');

@@ -7,7 +7,16 @@ const vm = require('node:vm');
 const { group, ok, summarize } = require('./common');
 
 const ROOT = path.resolve(__dirname, '..');
-const JS_SRC = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'renderer.js'), 'utf8');
+// 阶段4 UI 重构:renderer.js 拆分为 js/ 多文件(经典 script 顺序加载)。
+// 测试按浏览器同等的加载顺序拼接执行 —— 与真实运行时全局词法环境等价。
+// (文件名 → 实际路径:页面级四件在 js/pages/)
+const JS_ORDER = [
+  ['core.js', 'js'], ['ui.js', 'js'], ['doubao.js', 'js'], ['tags.js', 'js'],
+  ['settings-shared.js', 'js'], ['services.js', 'js/pages'], ['library.js', 'js/pages'],
+  ['creation.js', 'js/pages'], ['workbench.js', 'js/pages'], ['config.js', 'js'],
+  ['status.js', 'js'], ['boot.js', 'js'],
+];
+const JS_SRC = JS_ORDER.map(([f, dir]) => fs.readFileSync(path.join(ROOT, 'src', 'renderer', dir, f), 'utf8')).join('\n;\n');
 const HTML_SRC = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'index.html'), 'utf8');
 
 // ---------- 迷你 DOM 桩 ----------

@@ -162,7 +162,12 @@ async function mkEnv() {
   // ============ 5. Renderer 失败反馈(静态核验) ============
   group('R5 Renderer 失败反馈(静态核验)');
   {
-    const renderer = fs.readFileSync(path.join(REPO, 'src/renderer/renderer.js'), 'utf8');
+    // 阶段4 UI 重构:renderer.js 拆分为 js/ 多文件,这里拼接全文(顺序与运行时一致)
+const RJS_ORDER = [['core.js','js'],['ui.js','js'],['doubao.js','js'],['tags.js','js'],
+  ['settings-shared.js','js'],['services.js','js/pages'],['library.js','js/pages'],
+  ['creation.js','js/pages'],['workbench.js','js/pages'],['config.js','js'],
+  ['status.js','js'],['boot.js','js']];
+const renderer = RJS_ORDER.map(([f, d]) => fs.readFileSync(path.join(REPO, 'src', 'renderer', d, f), 'utf8')).join('\n');
     // saveGameProcs 必须检查返回值
     const m1 = renderer.match(/async function saveGameProcs[\s\S]{0,400}?\n\}/);
     ok('R5-1', 'saveGameProcs 检查 saveConfig 返回值', !!m1 && /r\.ok\s*===?\s*false/.test(m1[0]), m1 ? '已检查' : '未找到函数');

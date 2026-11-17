@@ -125,7 +125,12 @@ async function mkEnv() {
   // ---------- Z. 静态核验(非运行时,如实标注) ----------
   group('Z 静态核验');
   {
-    const renderer = fs.readFileSync(path.join(REPO, 'src/renderer/renderer.js'), 'utf8');
+    // 阶段4 UI 重构:renderer.js 拆分为 js/ 多文件,这里拼接全文(顺序与运行时一致)
+const RJS_ORDER = [['core.js','js'],['ui.js','js'],['doubao.js','js'],['tags.js','js'],
+  ['settings-shared.js','js'],['services.js','js/pages'],['library.js','js/pages'],
+  ['creation.js','js/pages'],['workbench.js','js/pages'],['config.js','js'],
+  ['status.js','js'],['boot.js','js']];
+const renderer = RJS_ORDER.map(([f, d]) => fs.readFileSync(path.join(REPO, 'src', 'renderer', d, f), 'utf8')).join('\n');
     const mainSrc = fs.readFileSync(path.join(REPO, 'src/main/main.js'), 'utf8');
     ok('Z1', 'renderer.js 处理 imageModelsError', /imageModelsError/.test(renderer), '命中 ' + (renderer.match(/imageModelsError/g) || []).length + ' 处');
     ok('Z2', 'renderer.js 处理 historyWriteError', /historyWriteError/.test(renderer), '命中 ' + (renderer.match(/historyWriteError/g) || []).length + ' 处');

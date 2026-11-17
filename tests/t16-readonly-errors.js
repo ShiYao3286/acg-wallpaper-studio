@@ -54,7 +54,12 @@ async function mkEnv() {
 
   group('C renderer 区分空数据与读取失败');
   {
-    const js = fs.readFileSync(path.join(ROOT, 'src', 'renderer', 'renderer.js'), 'utf8');
+    // 阶段4 UI 重构:renderer.js 拆分为 js/ 多文件,这里拼接全文(顺序与运行时一致)
+const RJS_ORDER = [['core.js','js'],['ui.js','js'],['doubao.js','js'],['tags.js','js'],
+  ['settings-shared.js','js'],['services.js','js/pages'],['library.js','js/pages'],
+  ['creation.js','js/pages'],['workbench.js','js/pages'],['config.js','js'],
+  ['status.js','js'],['boot.js','js']];
+const js = RJS_ORDER.map(([f, d]) => fs.readFileSync(path.join(ROOT, 'src', 'renderer', d, f), 'utf8')).join('\n');
     ok('C1', 'renderer 有 emptyTipOrError 辅助函数', js.indexOf('async function emptyTipOrError') >= 0);
     ok('C2', 'loadHistory 走 emptyTipOrError', /loadHistory[\s\S]{0,400}emptyTipOrError\(box, 'list-history'/.test(js));
     ok('C3', 'loadFavorites 走 emptyTipOrError', /loadFavorites[\s\S]{0,400}emptyTipOrError\(box, 'list-favorites'/.test(js));

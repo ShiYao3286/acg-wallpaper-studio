@@ -1,0 +1,17 @@
+/* base.css:设计变量与全局基础。自 index.html <style> 迁出(阶段4 UI 重构批1,内容逐行未改)。 */
+:root {
+  --bg0:#0e0c1a; --bg1:#1a1530;
+  --glass:rgba(255,255,255,0.05); --glass2:rgba(255,255,255,0.08);
+  --line:rgba(255,255,255,0.09);
+  --text:#ece9f8; --sub:#9b94b8;
+  --grad:linear-gradient(135deg,#8b5cf6,#ec4899);
+  --accent:#8b5cf6;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html,body { height:100%; }
+body { font-family:"Microsoft YaHei",sans-serif; color:var(--text);
+  background:linear-gradient(160deg,var(--bg0),var(--bg1));
+  height:100vh; overflow:hidden; user-select:none; position:relative; }
+.glow { position:fixed; border-radius:50%; filter:blur(90px); opacity:0.5; pointer-events:none; z-index:0; }
+.glow.g1 { width:480px; height:480px; background:#6d28d9; top:-160px; right:-120px; }
+.glow.g2 { width:420px; height:420px; background:#be185d; bottom:-180px; left:-140px; opacity:0.35; }

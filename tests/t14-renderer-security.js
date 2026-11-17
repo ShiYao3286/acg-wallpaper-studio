@@ -6,10 +6,18 @@ const { group, ok, summarize } = require('./common');
 
 const ROOT = path.resolve(__dirname, '..');
 const HTML = path.join(ROOT, 'src', 'renderer', 'index.html');
-const RENDERER = path.join(ROOT, 'src', 'renderer', 'renderer.js');
-
+// 阶段4 UI 重构:renderer.js 拆分为 js/ 多文件,断言改为拼接全文(与运行时等价)
+// (文件名 → 实际路径:页面级四件在 js/pages/)
+const JS_ORDER = [
+  ['core.js', 'js'], ['ui.js', 'js'], ['doubao.js', 'js'], ['tags.js', 'js'],
+  ['settings-shared.js', 'js'], ['services.js', 'js/pages'], ['library.js', 'js/pages'],
+  ['creation.js', 'js/pages'], ['workbench.js', 'js/pages'], ['config.js', 'js'],
+  ['status.js', 'js'], ['boot.js', 'js'],
+];
 const html = fs.readFileSync(HTML, 'utf8');
-const js = fs.readFileSync(RENDERER, 'utf8');
+const RENDERER_FILES = JS_ORDER.map(([f, dir]) => path.join(ROOT, 'src', 'renderer', dir, f));
+const js = RENDERER_FILES.map(f => fs.readFileSync(f, 'utf8')).join('\n');
+const rendererFilesExist = RENDERER_FILES.every(f => fs.existsSync(f));
 
 (async () => {
   group('A CSP 配置');
@@ -27,8 +35,10 @@ const js = fs.readFileSync(RENDERER, 'utf8');
     ok('A6', 'object-src frame-src base-uri form-action 均为 none',
       csp.indexOf("object-src 'none'") >= 0 && csp.indexOf("frame-src 'none'") >= 0 &&
       csp.indexOf("base-uri 'none'") >= 0 && csp.indexOf("form-action 'none'") >= 0);
-    ok('A7', 'style-src 保留 unsafe-inline,否则界面失去样式',
-      /style-src[^;]*'unsafe-inline'/.test(csp) && html.indexOf('<style>') >= 0);
+    // 阶段4 UI 重构:<style> 已拆分为 styles/*.css 外链;style-src 需同时允许 self(外链)与 unsafe-inline(动态样式)
+    ok('A7', 'style-src 保留 unsafe-inline 且样式为 styles/ 外链',
+      /style-src[^;]*'unsafe-inline'/.test(csp) && /style-src[^;]*'self'/.test(csp)
+      && (html.match(/rel="stylesheet" href="styles\//g) || []).length === 4);
   }
 
   group('B 内联事件清除');
@@ -69,6 +79,7 @@ const js = fs.readFileSync(RENDERER, 'utf8');
   {
     const assigns = [...js.matchAll(/innerHTML\s*=\s*([^;\n]+)/g)].map(x => x[1].trim());
     const dangerous = assigns.filter(v => v !== "''" && v !== '""');
+    ok('D0', 'js/ 拆分文件全部存在(12 个)', rendererFilesExist, JS_ORDER.join(','));
     ok('D1', 'renderer.js 无 innerHTML 注入,仅允许清空赋值', dangerous.length === 0,
       dangerous.length ? '可疑: ' + dangerous.join(' | ') : assigns.length + ' 处赋值全部为清空语义');
     ok('D2', 'renderer.js 不使用 fetch XHR WebSocket,与 connect-src none 相符',
