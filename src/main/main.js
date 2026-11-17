@@ -28,6 +28,7 @@ const doubaoTransport = require('./plugins/builtin/doubao-transport');
 const doubaoProvider = require('./plugins/builtin/doubao-provider');
 // 换壁纸事务(阶段2 第6步从 main.js 迁出)
 const wallpaperService = require('./services/wallpaper-service');
+const taskService = require('./services/task-service');
 
 let win = null;
 let tray = null;
@@ -430,6 +431,10 @@ async function saveConfig(patch) {
 
 // ---------- 壁纸目录 ----------
 const wallDir = () => path.join(app.getPath('pictures'), 'ACG_Wallpaper');
+// 阶段4:待确认图片目录(userData/pending)。不放壁纸目录:watcher 只认壁纸目录里的
+// 五件套契约文件,pending 存这里不会触发「旧脚本换图」误报,也不参与历史归档。
+function pendingDir() { return path.join(app.getPath('userData'), 'pending'); }
+
 async function ensureDir() { await fsp.mkdir(wallDir(), { recursive: true }); }
 const currentPath = () => path.join(wallDir(), 'current.jpg');
 
@@ -609,6 +614,21 @@ async function readWallpaperMeta() {
   } catch { return null; }
 }
 
+// 阶段4:pending 状态查询(ai-pending-get 与 get-status 共用)。只回传元数据与 imageVersion,
+// 绝不回传绝对路径。
+async function readPendingState() {
+  const p = path.join(pendingDir(), 'image.jpg');
+  try {
+    const st = await fsp.stat(p);
+    let meta = {};
+    try { meta = JSON.parse(stripBom(await fsp.readFile(path.join(pendingDir(), 'meta.json'), 'utf8'))); } catch {}
+    return { exists: true, imageVersion: st.mtimeMs, bytes: st.size,
+      prompt: meta.prompt || '', createdAt: meta.createdAt || 0 };
+  } catch {
+    return { exists: false };
+  }
+}
+
 // ---------- 旧计划任务停用 ----------
 function disableOldTask() {
   return new Promise((res) => {
@@ -776,6 +796,117 @@ ipcMain.handle('change-wallpaper', (e, reason) => {
     return argFail(err);
   }
   return changeWallpaper(r);
+});
+// ---------- AI 生成/应用/放弃(阶段4:预览确认流) ----------
+// pending 元数据结构: { version:1, prompt, randomMode, createdAt, engine }。
+// imageVersion 取 mtimeMs,渲染层用它做预览图缓存失效(同一路径名重复使用)。
+const PENDING_META_VERSION = 1;
+function readPendingMeta() {
+  try { return JSON.parse(stripBom(fs.readFileSync(path.join(pendingDir(), 'meta.json'), 'utf8'))); }
+  catch { return null; }
+}
+async function writePendingMeta(meta) {
+  await fsp.mkdir(pendingDir(), { recursive: true });
+  const tmp = path.join(pendingDir(), 'meta.json.' + process.pid + '.' + Math.random().toString(36).slice(2, 8) + '.tmp');
+  await fsp.writeFile(tmp, JSON.stringify(meta, null, 2), 'utf8');
+  await fsp.rename(tmp, path.join(pendingDir(), 'meta.json'));
+}
+// 与 changeWallpaper 的 AI 分支逐字一致的取图逻辑(prompt 组装/引擎路由),
+// 唯一区别:返回 buffer 而不是走壁纸事务。
+async function generateAiBuffer(cfg, finalPrompt) {
+  return await fetchAI(cfg, cfg.activeImageService, finalPrompt);
+}
+ipcMain.handle('ai-generate', async (e, rawPrompt) => {
+  if (rawPrompt !== undefined && rawPrompt !== null && typeof rawPrompt !== 'string') return { ok: false, error: '无效的提示词' };
+  if (typeof rawPrompt === 'string' && rawPrompt.length > 2000) return { ok: false, error: '提示词过长(上限 2000 字符)' };
+  if (changing) return { ok: false, error: '正在换图中,请稍候' };
+  const cfg = await loadConfig();
+  // prompt 组装与 changeWallpaper AI 分支一致:显式提示词优先,否则按 randomMode 走本地词池。
+  const mode = cfg.ai.randomMode || 'any';
+  // 与 changeWallpaper('ai') 的组装一致:custom 模式用配置提示词,其余按本地词池随机。
+  const finalPrompt = (typeof rawPrompt === 'string' && rawPrompt.trim())
+    ? rawPrompt
+    : (mode === 'custom' && cfg.ai.prompt ? cfg.ai.prompt : buildRandomPrompt(mode));
+  const id = taskService.beginTask('generate', 'AI 生图(预览)');
+  taskService.stepTask(id, 'generate', 'running');
+  try {
+    const buf = await generateAiBuffer(cfg, finalPrompt);
+    if (!buf || buf.length < 10240) throw new Error('生成的图片无效或过小');
+    taskService.stepTask(id, 'save-pending', 'running');
+    await fsp.mkdir(pendingDir(), { recursive: true });
+    // 一个用户同时至多一张待确认图:新任务覆盖旧 pending(先删 meta 再写文件,
+    // 读取方以 meta.json 存在且 image.jpg 可读为「有效 pending」判据)。
+    try { await fsp.unlink(path.join(pendingDir(), 'meta.json')); } catch {}
+    await fsp.writeFile(path.join(pendingDir(), 'image.jpg'), buf);
+    await writePendingMeta({ version: PENDING_META_VERSION, prompt: finalPrompt,
+      randomMode: mode, createdAt: Date.now(), taskId: id,
+      engine: (cfg.ai && cfg.ai.imageEngine) || 'service' });
+    taskService.stepTask(id, 'save-pending', 'done');
+    taskService.endTask(id, true);
+    const st = await readPendingState();
+    return ok({ taskId: id, prompt: finalPrompt, bytes: buf.length, imageVersion: st.imageVersion,
+      engine: (cfg.ai && cfg.ai.imageEngine) || 'service' });
+  } catch (err) {
+    taskService.endTask(id, false, (err && err.message) || String(err));
+    // 生成失败:清掉可能已损坏的 pending,避免渲染层拿到半截文件
+    try { await fsp.unlink(path.join(pendingDir(), 'image.jpg')); } catch {}
+    try { await fsp.unlink(path.join(pendingDir(), 'meta.json')); } catch {}
+    return failFrom(err, classifyError(err));
+  }
+});
+ipcMain.handle('ai-apply', async (e, rawTaskId) => {
+  if (typeof rawTaskId !== 'string' || !rawTaskId) return { ok: false, error: '无效的任务 id' };
+  const meta = readPendingMeta();
+  const pendingFile = path.join(pendingDir(), 'image.jpg');
+  if (!meta || !fs.existsSync(pendingFile)) {
+    return fail('没有待应用的生成图片', ERROR_CODES.E_NOT_FOUND);
+  }  // taskId 关联校验:渲染层必须回传 ai-generate 返回的 id。pending 被更新的生成覆盖后,
+  // 旧界面状态的 apply/discard 会拿到不匹配 id,按过期处理,避免误用旧意图。
+  if (meta.taskId !== rawTaskId) {
+    return fail('任务已过期或id不匹配,请刷新预览后重试', ERROR_CODES.E_STATE);
+  }
+  // 路径边界:应用动作不接收任何路径参数,只处理主进程自己写入的 pending 文件
+  let buf;
+  try { buf = await fsp.readFile(pendingFile); } catch (err) {
+    return failFrom(err, ERROR_CODES.E_IO);
+  }
+  const taskMeta = { source: 'ai', prompt: meta.prompt || '', randomMode: meta.randomMode || '' };
+  const id = taskService.beginTask('apply', '应用生成的图片');
+  taskService.stepTask(id, 'apply', 'running');
+  // holdChanging:独立入口自行持锁;wallpaper-service.applyBuffer 负责全部事务与回滚
+  const r = await wallpaperService.applyBuffer(buf, taskMeta, { holdChanging: true });
+  taskService.stepTask(id, 'apply', r && r.ok ? 'done' : 'failed', (r && !r.ok) ? (r.error || '') : '');
+  taskService.endTask(id, !!(r && r.ok), (r && !r.ok) ? (r.error || '') : '');
+  // 应用成功后 pending 即完成使命;失败时保留 pending,用户可重试应用或放弃
+  if (r && r.ok) {
+    try { await fsp.unlink(pendingFile); } catch {}
+    try { await fsp.unlink(path.join(pendingDir(), 'meta.json')); } catch {}
+  }
+  return r;
+});
+ipcMain.handle('ai-discard', async (e, rawTaskId) => {
+  if (typeof rawTaskId !== 'string' || !rawTaskId) return { ok: false, error: '无效的任务 id' };
+  const meta = readPendingMeta();
+  if (!meta) return { ok: true, discarded: true, hadPending: false };  if (meta.taskId !== rawTaskId) {
+    return fail('任务已过期或id不匹配,请刷新预览后重试', ERROR_CODES.E_STATE);
+  }
+  try { await fsp.unlink(path.join(pendingDir(), 'image.jpg')); } catch {}
+  try { await fsp.unlink(path.join(pendingDir(), 'meta.json')); } catch {}
+  const id = taskService.beginTask('discard', '放弃生成的图片');
+  taskService.endTask(id, true);
+  return ok({ discarded: true, hadPending: true });
+});
+ipcMain.handle('ai-pending-get', async () => {
+  const st = await readPendingState();
+  if (!st.exists) return ok({ exists: false });
+  const meta = readPendingMeta();
+  if (!meta) {
+    // meta 缺失=无效 pending(半截写入或已被清),按不存在处理
+    return ok({ exists: false });
+  }
+  return ok({ exists: true, imageVersion: st.imageVersion, bytes: st.bytes,
+    prompt: st.prompt, createdAt: st.createdAt, taskId: meta.taskId || '',
+    engine: meta.engine || 'service', randomMode: meta.randomMode || '' });
 });
 // 只读通道的失败记录(阶段2 第5步)
 // 问题背景:旧实现是 catch { return [] } —— 磁盘不可读与"目录本来就空"在渲染层完全同形,
@@ -963,6 +1094,9 @@ ipcMain.handle('get-status', async () => {
     imageModels,
     // 旧脚本回执与旧任务状态
     scriptMeta: meta,
+    // 阶段4:任务中心快照(内存态,含最近 10 条)与 pending 摘要(不含路径)
+    task: taskService.snapshot(),
+    pending: await readPendingState(),
     oldTaskRunning: !(cfg.migrate && cfg.migrate.oldTaskDisabled),
   };
 });
@@ -1653,6 +1787,16 @@ if (!app.requestSingleInstanceLock()) {
     // 阶段3.9:恢复会话绑定。损坏/版本不符时 session-service 内部安全降级,不阻塞启动。
     // 账号指纹不符的绑定会在下一次请求时被 reconcileAccount 作废(换号/重登场景)。
     try { await sessionService.restore(); } catch (e) { /* 恢复失败不阻塞启动 */ }
+    // 阶段4:清理上次运行遗留的孤儿 pending(应用中断/崩溃留下)。
+    // pending 是临时工作区,启动时清空即回到「无待确认图」的干净状态。
+    try {
+      const pd = pendingDir();
+      if (fs.existsSync(pd)) {
+        for (const f of await fsp.readdir(pd)) {
+          try { await fsp.unlink(path.join(pd, f)); } catch {}
+        }
+      }
+    } catch (e) { /* 清理失败不阻塞启动 */ }
     startWatcher();
   });
 }

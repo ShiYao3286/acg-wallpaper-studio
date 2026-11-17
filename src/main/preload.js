@@ -3,7 +3,10 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('api', {
   getConfig: () => ipcRenderer.invoke('get-config'),
   saveConfig: (key, val) => ipcRenderer.invoke('save-config', key, val),
-  changeWallpaper: (reason) => ipcRenderer.invoke('change-wallpaper', reason),
+  changeWallpaper: (reason) => ipcRenderer.invoke('change-wallpaper', reason),  aiGenerate: (prompt) => ipcRenderer.invoke('ai-generate', prompt),
+  aiApply: (taskId) => ipcRenderer.invoke('ai-apply', taskId),
+  aiDiscard: (taskId) => ipcRenderer.invoke('ai-discard', taskId),
+  aiPendingGet: () => ipcRenderer.invoke('ai-pending-get'),
   listHistory: () => ipcRenderer.invoke('list-history'),
   useHistory: (name) => ipcRenderer.invoke('use-history', name),
   getStatus: () => ipcRenderer.invoke('get-status'),

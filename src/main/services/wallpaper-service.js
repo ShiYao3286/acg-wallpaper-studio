@@ -231,46 +231,23 @@ async function healInterruptedTransaction() {
   }
 }
 
-// ---------- 核心:换壁纸流程 ----------
-// 事务顺序:取图到 tmp -> 归档旧图 -> tmp 转正式 -> 设系统壁纸 -> 清理历史 -> 写回执
-// 任一步失败都回滚到调用前状态;回滚错误与原始错误一起返回。
-async function changeWallpaper(reason) {
-  const why = reason || 'schedule';
-  if (!deps.acquireChanging()) return { ok: false, error: '正在换图中,请稍候' };
+// ---------- 应用已生成的图片(阶段4:预览确认后复用壁纸事务) ----------
+// 事务顺序与 changeWallpaper 逐字一致:归档 -> 转正 -> 设壁纸 -> 清理历史 -> 写历史/回执,
+// 任一步失败回滚到调用前状态。区别仅在图片来源:changeWallpaper 现场取图,
+// applyBuffer 接收已生成的 buffer(main 进程 pending 文件读出)。
+// opts.holdChanging=true 时由本函数自行获取/释放 changing 互斥(ai-apply 独立入口);
+// changeWallpaper 调用时不传(锁由它自己持有),避免重复加锁。
+async function applyBuffer(buf, meta, opts) {
+  const o = opts || {};
+  if (o.holdChanging && !deps.acquireChanging()) {
+    return fail('正在换图中,请稍候', ERROR_CODES.E_STATE);
+  }
   // 事务上下文:必须在进入流程前快照,"调用前 current 是否存在"是回滚的判据
-  // 注意:不能在归档分支里才赋值——若在归档前就失败(如下载超时),hadCurrent 会保持初始值,
-  // 回滚将误判为"原本无壁纸"并删除用户的 current.jpg
   const tx = { hadCurrent: fs.existsSync(currentPath()), archivedHist: null, touchedCurrent: false };
   const tmp = path.join(wallDir(), 'current.tmp.jpg');
   try {
     const cfg = await deps.loadConfig();
-    const game = await deps.gameRunning(cfg);
-    if (game && why === 'schedule') {
-      deps.setLastInfo('检测到游戏 ' + game + ' 运行中,已跳过本次换图 (' + deps.nowStr() + ')');
-      return { ok: false, error: 'game-running', game };
-    }
     await deps.ensureDir();
-
-    // 1. 获取图片到临时文件
-    let buf, meta = {};
-    if (why === 'ai' || cfg.source === 'ai') {
-      const mode = cfg.ai.randomMode || 'any';
-      const finalPrompt = (mode === 'custom' || why === 'ai-explicit')
-        ? cfg.ai.prompt
-        : deps.buildRandomPrompt(mode === 'custom' ? 'any' : mode);
-      buf = await deps.fetchAI(cfg, cfg.activeImageService, finalPrompt);
-      meta.prompt = finalPrompt;
-      meta.randomMode = mode;
-      meta.source = 'ai';
-    } else {
-      meta.source = 'lolicon';
-      const info = await deps.fetchLolicon(cfg);
-      meta = info;
-      const r = await deps.netFetch(info.url, { signal: AbortSignal.timeout(60000) });
-      if (!r.ok) throw new Error('下载图片失败 HTTP ' + r.status);
-      buf = Buffer.from(await r.arrayBuffer());
-    }
-    if (!buf || buf.length < 10240) throw new Error('下载的图片无效或过小');
     deps.markSelfWrite();
     await fsp.writeFile(tmp, buf);
 
@@ -328,6 +305,95 @@ async function changeWallpaper(reason) {
     const rollbackErrs = await rollbackWallpaper(tx);
     return buildFailureResult(e, rollbackErrs);
   } finally {
+    if (o.holdChanging) deps.releaseChanging();
+  }
+}
+
+// ---------- 核心:换壁纸流程 ----------
+// 事务顺序:取图到 tmp -> 归档旧图 -> tmp 转正式 -> 设系统壁纸 -> 清理历史 -> 写回执
+// 任一步失败都回滚到调用前状态;回滚错误与原始错误一起返回。
+async function changeWallpaper(reason) {
+  const why = reason || 'schedule';
+  if (!deps.acquireChanging()) return { ok: false, error: '正在换图中,请稍候' };
+  // 事务上下文:必须在进入流程前快照,"调用前 current 是否存在"是回滚的判据
+  // 注意:不能在归档分支里才赋值——若在归档前就失败(如下载超时),hadCurrent 会保持初始值,
+  // 回滚将误判为"原本无壁纸"并删除用户的 current.jpg
+  const tx = { hadCurrent: fs.existsSync(currentPath()), archivedHist: null, touchedCurrent: false };
+  const tmp = path.join(wallDir(), 'current.tmp.jpg');
+  try {
+    const cfg = await deps.loadConfig();
+    const game = await deps.gameRunning(cfg);
+    if (game && why === 'schedule') {
+      deps.setLastInfo('检测到游戏 ' + game + ' 运行中,已跳过本次换图 (' + deps.nowStr() + ')');
+      return { ok: false, error: 'game-running', game };
+    }
+    await deps.ensureDir();
+
+    // 1. 获取图片到临时文件
+    let buf, meta = {};
+    if (why === 'ai' || cfg.source === 'ai') {
+      const mode = cfg.ai.randomMode || 'any';
+      const finalPrompt = (mode === 'custom' || why === 'ai-explicit')
+        ? cfg.ai.prompt
+        : deps.buildRandomPrompt(mode === 'custom' ? 'any' : mode);
+      buf = await deps.fetchAI(cfg, cfg.activeImageService, finalPrompt);
+      meta.prompt = finalPrompt;
+      meta.randomMode = mode;
+      meta.source = 'ai';
+    } else {
+      meta.source = 'lolicon';
+      const info = await deps.fetchLolicon(cfg);
+      meta = info;
+      const r = await deps.netFetch(info.url, { signal: AbortSignal.timeout(60000) });
+      if (!r.ok) throw new Error('下载图片失败 HTTP ' + r.status);
+      buf = Buffer.from(await r.arrayBuffer());
+    }
+    if (!buf || buf.length < 10240) throw new Error('下载的图片无效或过小');
+
+    // 阶段4:取图后的事务主体(落盘/归档/转正/设壁纸/清理/历史/回执)抽为 applyBuffer,
+    // 供「生成后确认再应用」的预览路径复用。行为逐字迁出,本函数现场取图,流程不变。
+    return await applyBuffer(buf, meta);
+
+    // 5. 确认切换成功后才清理历史,避免回滚所需的归档被提前删除
+    await pruneHistory(cfg);
+
+    // 追加元数据记录(JSONL,按文件名可回查)
+    // 注意:壁纸已成功替换,这里的失败不能让整次换图判为失败(否则 UI 会说"换图失败"而桌面其实已经换了),
+    // 但也绝不能静默吞掉——错误写进 historyWriteError 一并返回。
+    let historyWriteError = '';
+    try {
+      const record = { file: 'current.jpg', time: new Date().toISOString(), source: meta.source || 'lolicon',
+        title: meta.title || '', author: meta.author || '', pid: meta.pid || '', tag: meta.tag || '',
+        prompt: meta.prompt || '', bytes: buf.length };
+      deps.markSelfWrite();
+      await fsp.appendFile(path.join(wallDir(), 'history.jsonl'), JSON.stringify(record) + '\n', 'utf8');
+      const receipt = { time: deps.nowStr(), source: 'app', tag: meta.tag || '',
+        title: meta.title || '', author: meta.author || '', pid: meta.pid || '',
+        file: 'current.jpg', bytes: buf.length, prompt: meta.prompt || '',
+        randomMode: meta.randomMode || '' };
+      deps.markSelfWrite();
+      await fsp.writeFile(path.join(wallDir(), 'wallpaper_meta.json'), JSON.stringify(receipt, null, 2), 'utf8');
+    } catch (e) {
+      historyWriteError = (e && e.message) || String(e);
+    }
+
+    deps.setLastInfo((meta.title ? (meta.title + ' / ' + meta.author + ' / pid:' + meta.pid) : ('AI: ' + (meta.prompt || '').slice(0, 40) + '…')) +
+      ' · ' + (buf.length / 1024).toFixed(0) + 'KB · ' + deps.nowStr());
+    // 与原实现保持一致:先把同一个对象交给 lastRun,再改它的 detail。
+    // 这样"历史记录写入失败"的说明能挂到 lastRun 上(托盘 tooltip 会读它),
+    // 而不是被一次新的对象替换掉。
+    const runInfo = { time: deps.nowStr(), ok: true };
+    deps.setLastRun(runInfo);
+    if (historyWriteError) {
+      runInfo.detail = '历史记录写入失败: ' + historyWriteError;
+      return ok({ ...meta, historyWriteError });
+    }
+    return ok({ ...meta });
+  } catch (e) {
+    try { if (fs.existsSync(tmp)) await fsp.unlink(tmp); } catch {}
+    const rollbackErrs = await rollbackWallpaper(tx);
+    return buildFailureResult(e, rollbackErrs);
+  } finally {
     deps.releaseChanging();
   }
 }
@@ -335,6 +401,7 @@ async function changeWallpaper(reason) {
 module.exports = {
   init,
   changeWallpaper,
+  applyBuffer,
   archiveCurrent,
   healInterruptedTransaction,
   rollbackWallpaper,

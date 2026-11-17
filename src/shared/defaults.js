@@ -26,6 +26,9 @@ const DEFAULT_CONFIG = {
     //   'service' OpenAI 兼容服务(默认,保持既有行为)
     //   'doubao'  豆包账号 Seedream(需先登录)
     imageEngine: 'service',
+    // 阶段4:生成预览模式。false=生成后直接应用(既有行为);true=生成后进入预览,
+    // 用户确认后再应用。默认 false 保证升级后行为零变化。
+    previewMode: false,
   },
   // 提示词预设槽
   promptPresets: [
