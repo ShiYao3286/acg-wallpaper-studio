@@ -6,16 +6,28 @@
 const $ = id => document.getElementById(id);
 
 // ---------- 导航 ----------
-document.querySelectorAll('.nav-item').forEach(el => {
+// 5 入口:舞台 / AI 创作 / 图库 / 插件中心 / 设置。
+// 舞台不是 .page,而是 #view-stage 三件套(舞台/缩略带/命令条),与功能页互斥。
+document.querySelectorAll('.ri[data-page]').forEach(el => {
   el.addEventListener('click', () => {
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    el.classList.add('active');
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    $('page-' + el.dataset.page).classList.add('active');
-    // 六页各自的进入时加载(阶段4 UI 重构:页面 id 变更,加载逻辑等价迁移)
-    if (el.dataset.page === 'library') { loadHistory(); loadFavorites(); }
-    if (el.dataset.page === 'plugins') { loadServices(); refreshDoubao(); loadPluginList(); }
-    if (el.dataset.page === 'creation') loadPresets();
+    const page = el.dataset.page;
+    document.querySelectorAll('.ri[data-page]').forEach(n => n.classList.remove('on'));
+    el.classList.add('on');
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('on'));
+    const stageView = $('view-stage');
+    if (stageView) stageView.classList.toggle('off', page !== 'stage');
+    if (page === 'stage') {
+      // refreshStage 由 stage.js 提供;core.js 先加载,点击时它已就绪
+      if (typeof refreshStage === 'function') refreshStage();
+    } else {
+      const target = $('page-' + page);
+      if (target) target.classList.add('on');
+    }
+    if (page === 'library') { loadHistory(); loadFavorites(); }
+    // 「模型」页接管了原来的账号/服务/模型配置;插件页只管插件本身
+    if (page === 'models') { loadServices(); refreshDoubao(); refreshStatus(); }
+    if (page === 'plugins') { loadPluginList(); }
+    if (page === 'creation') { loadPresets(); refreshAssistEngine(); }
   });
 });
 
@@ -39,6 +51,10 @@ function switchLibTab(tab) {
 const CLICK_ACTIONS = {
   'win-minimize': () => api.win.minimize(),
   'win-close': () => api.win.close(),
+  'win-maximize': () => api.win.maximize(),
+  'open-log-dir': () => api.openLogDir().then((r) => {
+    if (r && r.ok === false) toast('打开日志目录失败: ' + (r.error || '未知错误'), 4000);
+  }).catch((e) => toast('打开日志目录失败: ' + ((e && e.message) || e), 4000)),
   'fav-current': () => favCurrent(),
   'change-now': () => changeNow(),
   'open-folder': () => openFolder(),
@@ -47,10 +63,13 @@ const CLICK_ACTIONS = {
   'ai-now': () => aiNow(),
   'lib-tab': (el) => switchLibTab(el.dataset.tab),
   // 阶段4 生成预览流
-  'ai-apply-now': () => aiApplyNow(),
-  'ai-regen': () => aiRegen(),
-  'ai-discard-now': () => aiDiscardNow(),
-  'new-service': () => newService(),
+  // 生成预览流已下线(生成结果直接进图库):预览卡上的三个动作不再存在
+  'new-service': (el) => newService(el && el.dataset.kind),
+  // 从创作页/舞台跳去「模型」页配置引擎
+  'goto-models': () => {
+    const b = document.querySelector('.ri[data-page="models"]');
+    if (b) b.click();
+  },
   'fetch-models': () => fetchModels(),
   'save-service': () => saveService(),
   'test-editing': () => testEditing(),
@@ -63,12 +82,24 @@ const CLICK_ACTIONS = {
   'set-mode': (el) => setRandomMode(el.dataset.mode),
   'step-interval': (el) => stepInterval(Number(el.dataset.delta)),
   'roll-preview': (el) => rollPreview(el),
+  // 舞台命令条(实现放 js/pages/stage.js)
+  'cmd-source': () => cmdToggleSource(),
+  'cmd-loop': () => cmdToggleLoop(),
+  'cmd-game': () => cmdToggleGame(),
+  'cmd-next': () => cmdGotoSettings(),
+  'goto-favorites': () => {
+    document.querySelector('.ri[data-page="library"]').click();
+    switchLibTab('favorites');
+  },
   // 阶段3 豆包
   'doubao-login': () => doubaoLogin(),
   'doubao-relogin': () => doubaoLogin(),
   'doubao-cancel-login': () => api.doubao.cancelLogin().then(() => refreshDoubao()).catch(() => {}),
   'doubao-logout': () => doubaoLogout(),
   'doubao-new-session': () => doubaoNewSession(),
+  'doubao-bind-session': () => doubaoBindSession(),
+  'doubao-conv-list': () => doubaoConvList(),
+  'doubao-conv-bind': () => doubaoConvBind(),
   'doubao-accept-risk': () => doubaoAcceptRisk(),
   'doubao-decline-risk': () => doubaoDeclineRisk(),
   'doubao-test-text': () => doubaoTestText(),
@@ -79,20 +110,16 @@ const CLICK_ACTIONS = {
 document.addEventListener('change', (ev) => {
   const t = ev.target;
   if (!t) return;
+  // 豆包模型下拉走自定义保存(要同时写模型与推理强度)
   if (t.id === 'doubao-model-select' || t.id === 'doubao-effort-select') {
     saveDoubaoModel();
     return;
-  }
-  // AI 页模型下拉改为自定义处理(需要区分 doubao / svc: 两种值)
-  if (t.id === 'ai-model') {
-    ev.stopPropagation();
-    onAiModelChange();
   }
 }, true);
 
 // change 类:key 来自 data-key,值来自元素自身
 const CHANGE_SETTERS = {
-  str: (el) => saveStr(el.dataset.key, el.value),
+  str: (el, opts) => saveStr(el.dataset.key, el.value, opts),
   num: (el) => saveNum(el.dataset.key, el.value),
 };
 
@@ -129,6 +156,24 @@ document.addEventListener('change', (ev) => {
     return;
   }
   fn(el);
+});
+
+// textarea 原来只在 change(失焦)时保存:打完字直接关窗口/退托盘就丢。
+// 这里补一条 input 防抖(停手 800ms 就写),与 change 不冲突(值相同时重复写无害)。
+const __draftTimers = new Map();
+document.addEventListener('input', (ev) => {
+  const el = ev.target;
+  if (!el || el.tagName !== 'TEXTAREA') return;
+  const holder = el.closest('[data-set]');
+  if (!holder) return;
+  const kind = holder.dataset.set;
+  clearTimeout(__draftTimers.get(holder));
+  __draftTimers.set(holder, setTimeout(() => {
+    __draftTimers.delete(holder);
+    if (kind === 'game-procs') { saveGameProcs(holder.value, { silent: true }); return; }
+    const fn = CHANGE_SETTERS[kind];
+    if (fn) fn(holder, { silent: true });
+  }, 800));
 });
 
 // ---------- 豆包账号(阶段3 3.6) ----------

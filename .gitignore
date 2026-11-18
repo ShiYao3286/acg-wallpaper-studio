@@ -25,3 +25,13 @@ tests/last-run.json
 credentials.enc
 credentials.enc.*
 doubao/
+
+# 旧版单页界面(已被 index.html + 六页导航替代,仅本地留档)
+src/renderer/index.legacy.html
+
+# UI 预览截图(本地视觉验证产物,体积大且与代码无关)
+ui-previews/
+
+# 打包/调试残留
+probe*.js
+probe*.log

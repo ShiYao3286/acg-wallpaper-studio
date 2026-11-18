@@ -89,20 +89,40 @@ async function setRandomMode(mode) {
 }
 
 // ---------- 提示词助手 ----------
+// 引擎原来写死在 activeTextService 上,UI 只能看不能选 —— 这里补成下拉。
+// 只列 kind=text 的服务:画图服务不会写提示词,列进去只会误导。
+// 选择入口已移到「模型」页,这里只写一句"当前用的是谁"。
 async function refreshAssistEngine() {
   const cfg = await api.getConfig();
-  const textSvc = (cfg.services || []).find(s => s.id === cfg.activeTextService);
-  $('assist-engine').textContent = textSvc ? ('引擎: ' + textSvc.name + ' (' + textSvc.model + ')') : '引擎: 本地风格词池(未配置文本模型)';
+  const textSvcs = (cfg.services || []).filter(s => s.kind === 'text');
+  const activeId = cfg.activeTextService || '';
+  const curSvc = textSvcs.find(s => s.id === activeId);
+  const label = $('assist-engine');
+  if (label) {
+    let text;
+    if (activeId === 'builtin:doubao') text = '豆包 · 文本模型';
+    else if (curSvc) text = (curSvc.name || curSvc.id) + ' · ' + (curSvc.model || '未设模型');
+    else text = '本地词池(不调模型)';
+    label.textContent = '当前: ' + text;
+  }
 }
+
 async function runAssist() {
   const btn = $('btn-assist'); btn.disabled = true;
   try {
     const r = await api.aiAssistPrompt($('assist-theme').value);
-    if (r.ok) {
+    if (r && r.ok) {
       $('ai-prompt').value = r.prompt;
       await api.saveConfig('ai.prompt', r.prompt);
-      toast(r.local ? '本地增强完成' : '文本模型已生成提示词', 3500);
-    } else toast('失败: ' + r.error, 5000);
+      // 主进程在文本模型挂掉时会回落本地词池并带 warning,这里必须把原因说出来
+      if (r.warning) toast(r.warning, 6000);
+      else toast(r.local ? '本地增强完成' : '文本模型已生成提示词', 3500);
+    } else {
+      toast('生成提示词失败: ' + ((r && r.error) || '未知错误'), 5000);
+    }
+  } catch (e) {
+    // 原来这里没有 catch:IPC 一抛错就是 unhandled rejection,用户什么提示都看不到
+    toast('生成提示词失败: ' + ((e && e.message) || e), 5000);
   } finally { btn.disabled = false; }
 }
 

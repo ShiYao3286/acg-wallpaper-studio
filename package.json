@@ -26,6 +26,8 @@
     },
     "files": [
       "src/**/*",
+      "!src/renderer/index.legacy.html",
+      "!src/**/*.map",
       "assets/**/*",
       "package.json"
     ],

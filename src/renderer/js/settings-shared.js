@@ -1,9 +1,10 @@
 // settings-shared.js:配置保存原语与开关动作。自 renderer.js 逐行迁出。
 
-async function saveStr(key, val) {
+async function saveStr(key, val, opts) {
   const r = await api.saveConfig(key, String(val));
   if (r && r.ok === false) { toast('保存失败: ' + (r.error || '未知错误'), 4000); return; }
-  toast('已保存');
+  // 打字过程中的自动保存不弹 toast,否则每 800ms 闪一次
+  if (!(opts && opts.silent)) toast('已保存');
 }
 async function saveNum(key, val) {
   const r = await api.saveConfig(key, parseInt(val) || 0);
@@ -35,11 +36,11 @@ function stepInterval(d) {
   el.value = Math.min(720, Math.max(5, (parseInt(el.value) || 30) + d));
   saveNum('schedule.intervalMinutes', el.value);
 }
-async function saveGameProcs(txt) {
+async function saveGameProcs(txt, opts) {
   // 落盘失败必须让用户看见:原实现丢弃返回值,失败也提示"已保存"
   const r = await api.saveConfig('gameCheck.processes', txt.split('\n').map(s => s.trim()).filter(Boolean));
   if (r && r.ok === false) { toast('保存失败: ' + (r.error || '未知错误'), 4000); return; }
-  toast('已保存');
+  if (!(opts && opts.silent)) toast('已保存');
 }
 async function disableOldTask() {
   const r = await api.disableOldTask();

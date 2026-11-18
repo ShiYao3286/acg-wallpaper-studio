@@ -40,8 +40,12 @@ async function refreshDoubaoModels() {
     }
 
     // 提示:生图模型不可选(服务端路由)
+    // 画图模型:由豆包服务端按账号权益路由,客户端选不了;这里只如实展示
+    const imgEl = $('doubao-image-model');
+    const imgName = (m.imageModel && m.imageModel.name) || '未上报';
+    if (imgEl) imgEl.textContent = imgName;
     if (hint) {
-      hint.textContent = '画图:' + m.imageModel.name + '。生图不走模型选择,由豆包服务端按账号权益路由。';
+      hint.textContent = '文本模型与推理强度可自选;画图模型由豆包服务端按账号权益路由,不可自选。';
     }
     box.style.display = '';
   } catch (e) {
@@ -102,6 +106,8 @@ function doubaoButtons(st, riskAccepted) {
     if (risk) {
       btns.push({ act: 'doubao-test-text', label: '测试文本(消耗额度)' });
       btns.push({ act: 'doubao-test-image', label: '测试生图(消耗额度)' });
+      // 新建会话:换上下文用。原来只有 IPC 没有入口,等于该功能不存在。
+      btns.push({ act: 'doubao-new-session', label: '新建会话', ghost: true });
     }
     // 退出账号:永远显示。它是止损路径,不能被风险确认状态挡住。
     btns.push({ act: 'doubao-logout', label: '退出账号', ghost: true });
@@ -155,7 +161,9 @@ async function refreshDoubao() {
 
     const risk = $('doubao-risk');
     if (risk) {
-      risk.style.display = (!doubaoRiskAccepted && st.state !== 'authenticated') ? 'block' : 'none';
+      // 已登录但未确认也必须显示:原来只在"未登录"时显示,导致已登录 + 未确认时
+      // 按钮组只剩「退出账号」,用户没有任何入口去补确认。
+      risk.style.display = doubaoRiskAccepted ? 'none' : 'block';
     }
 
     // 操作区可见性。
@@ -189,7 +197,7 @@ async function refreshDoubao() {
             text = '当前工作会话已失效。下一次请求将自动创建新会话，之前的上下文不会自动继承。';
             sessBox.style.color = '#fbbf24';
           } else if (ss.hasSession) {
-            text = '工作会话进行中 · 自 ' + new Date(ss.createdAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) + ' 起。连续对话会继承此前上下文，旧要求可能影响后续结果。';
+            text = '工作会话 ' + (ss.sessionTag ? '#' + ss.sessionTag + ' ' : '') + '进行中 · 自 ' + new Date(ss.createdAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) + ' 起。连续对话会继承此前上下文，旧要求可能影响后续结果。';
             sessBox.style.color = '';
           } else {
             text = '尚未建立工作会话，下一次请求会自动创建。';
@@ -203,6 +211,13 @@ async function refreshDoubao() {
         sessBox.style.display = 'none';
       }
     }
+
+    // 绑定已有会话:仅登录后出现 —— 从豆包网页复制会话链接粘进来即可
+    const bindBox = $('doubao-bind');
+    if (bindBox) bindBox.style.display = (st.state === 'authenticated') ? '' : 'none';
+    // 拉取账号会话列表:同样仅登录后出现(走非公开接口,失败不影响粘贴绑定)
+    const convBox = $('doubao-conv');
+    if (convBox) convBox.style.display = (st.state === 'authenticated') ? '' : 'none';
 
     // 模型选择区:仅登录后显示;未登录时没有意义
     const modelBox = $('doubao-models');
@@ -290,6 +305,75 @@ async function doubaoNewSession() {
     refreshDoubao();
   } catch (e) {
     toast('新建会话失败: ' + ((e && e.message) || e), 4000);
+  }
+}
+
+// 绑定已有会话:接上自己在豆包里已有的对话,继承那边的上下文。
+async function doubaoBindSession() {
+  const inp = $('bind-session-input');
+  const val = (inp && inp.value || '').trim();
+  if (!val) { toast('先粘贴会话链接或会话 ID', 3500); return; }
+  const btn = document.querySelector('[data-act="doubao-bind-session"].btn');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api.doubao.bindSession(val);
+    if (r && r.ok) {
+      toast('已绑定会话' + (r.sessionTag ? ' #' + r.sessionTag : '') + ',下一次请求会在这个对话里继续', 5000);
+      if (inp) inp.value = '';
+    } else {
+      toast('绑定失败: ' + ((r && r.error) || '未知'), 5000);
+    }
+    refreshDoubao();
+  } catch (e) {
+    toast('绑定失败: ' + ((e && e.message) || e), 5000);
+  } finally { if (btn) btn.disabled = false; }
+}
+
+// 拉取账号里的会话列表(方案B):豆包非公开接口,失败时要说得清楚,别留个空下拉。
+async function doubaoConvList() {
+  toast('正在拉取账号会话列表…', 5000);
+  try {
+    const r = await api.doubao.conversationList();
+    if (!r || !r.ok) { toast('拉取失败: ' + ((r && r.error) || '未知错误'), 7000); return; }
+    const items = (r.items || []).slice();
+    const sel = $('conv-select');
+    const bindBtn = $('btn-conv-bind');
+    if (!sel) return;
+    sel.textContent = '';
+    for (const it of items) {
+      const o = document.createElement('option');
+      o.value = String(it.index);
+      o.textContent = it.title + '  #' + it.tag;
+      sel.appendChild(o);
+    }
+    if (!items.length) {
+      sel.style.display = 'none';
+      if (bindBtn) bindBtn.style.display = 'none';
+      toast('账号下没有可用于拉取的会话', 5000);
+      return;
+    }
+    sel.style.display = '';
+    if (bindBtn) bindBtn.style.display = '';
+    toast('拉到 ' + items.length + ' 个会话,选一条再点「绑定所选」', 5000);
+  } catch (e) {
+    toast('拉取失败: ' + ((e && e.message) || e), 6000);
+  }
+}
+
+// 绑定下拉里选中的那条会话(完整 ID 在主进程内存里,这里只传序号)
+async function doubaoConvBind() {
+  const sel = $('conv-select');
+  if (!sel || sel.value === '') { toast('先点「拉取账号会话」再选一条', 4000); return; }
+  try {
+    const r = await api.doubao.conversationSelect(sel.value);
+    if (r && r.ok) {
+      toast('已绑定会话' + (r.sessionTag ? ' #' + r.sessionTag : '') + (r.title ? '(' + r.title + ')' : '') + ',下一次请求在这个对话里继续', 6000);
+    } else {
+      toast('绑定失败: ' + ((r && r.error) || '未知'), 5000);
+    }
+    refreshDoubao();
+  } catch (e) {
+    toast('绑定失败: ' + ((e && e.message) || e), 5000);
   }
 }
 

@@ -14,6 +14,7 @@ const fs = require('node:fs');
 const fsp = fs.promises;
 const { stripBom } = require('../../shared/text');
 const { ok, fail, failFrom, ERROR_CODES } = require('../../shared/contracts');
+const { assertImage } = require('../../shared/image-sniff');
 
 // 注入的依赖(全部由 main.js 在 init 时提供)
 let deps = {
@@ -238,6 +239,9 @@ async function healInterruptedTransaction() {
 // opts.holdChanging=true 时由本函数自行获取/释放 changing 互斥(ai-apply 独立入口);
 // changeWallpaper 调用时不传(锁由它自己持有),避免重复加锁。
 async function applyBuffer(buf, meta, opts) {
+  // 唯一闸口:豆包 / OpenAI 兼容 / Lolicon 三条路的图最后都从这里落盘。
+  // 中转站返回"200 但正文是 HTML 错误页"太常见了,不校验就会把错误页设成壁纸。
+  try { assertImage(buf); } catch (err) { return fail(err.message, ERROR_CODES.E_INVALID_ARG); }
   const o = opts || {};
   if (o.holdChanging && !deps.acquireChanging()) {
     return fail('正在换图中,请稍候', ERROR_CODES.E_STATE);
@@ -306,6 +310,54 @@ async function applyBuffer(buf, meta, opts) {
     return buildFailureResult(e, rollbackErrs);
   } finally {
     if (o.holdChanging) deps.releaseChanging();
+  }
+}
+
+// 只入库、不动壁纸:AI 生图现在的默认落点。
+// 用户明确要求"生成完先进图库,要不要设为壁纸我自己在图库点",
+// 所以这里不写 current.jpg、不调 setWallpaper,只往图库放一张(hist_*.jpg + history.jsonl)。
+async function archiveBuffer(buf, meta, opts) {
+  try { assertImage(buf); } catch (err) { return fail(err.message, ERROR_CODES.E_INVALID_ARG); }
+  const m = meta || {};
+  const o = opts || {};
+  try {
+    const cfg = await deps.loadConfig();
+    await deps.ensureDir();
+    // 与 archiveCurrent 同一套命名 + 去重规则:同秒两张图撞名会被 Windows rename 静默覆盖
+    const base = 'hist_' + deps.ts();
+    let histName = base + '.jpg';
+    if (fs.existsSync(path.join(wallDir(), histName))) {
+      for (let n = 1; n <= 99; n++) {
+        histName = base + '_' + n + '.jpg';
+        if (!fs.existsSync(path.join(wallDir(), histName))) break;
+      }
+    }
+    deps.markSelfWrite();
+    await fsp.writeFile(path.join(wallDir(), histName), buf);
+
+    // histFile 指向刚写的文件,list-history 靠它对上提示词/来源/标签。
+    // file 刻意不写 current.jpg:否则下次换图时 archiveCurrent 回写 histFile 会改掉这条记录。
+    let historyWriteError = '';
+    try {
+      const record = {
+        file: histName, histFile: histName, time: new Date().toISOString(),
+        source: m.source || 'ai', title: m.title || '', author: m.author || '',
+        pid: m.pid || '', tag: m.tag || '', prompt: m.prompt || '',
+        randomMode: m.randomMode || '', bytes: buf.length, detached: true,
+      };
+      deps.markSelfWrite();
+      await fsp.appendFile(path.join(wallDir(), 'history.jsonl'), JSON.stringify(record) + '\n', 'utf8');
+    } catch (e) {
+      historyWriteError = (e && e.message) || String(e);
+    }
+    await pruneHistory(cfg);
+    if (o.updateLastInfo !== false) {
+      deps.setLastInfo('AI 生图已存入图库 · ' + (buf.length / 1024).toFixed(0) + 'KB · ' + deps.nowStr());
+    }
+    return ok({ fileName: histName, bytes: buf.length, prompt: m.prompt || '',
+      source: m.source || 'ai', historyWriteError });
+  } catch (e) {
+    return fail((e && e.message) || String(e), ERROR_CODES.E_IO);
   }
 }
 
@@ -402,6 +454,7 @@ module.exports = {
   init,
   changeWallpaper,
   applyBuffer,
+  archiveBuffer,
   archiveCurrent,
   healInterruptedTransaction,
   rollbackWallpaper,

@@ -1,9 +1,27 @@
 // ACG壁纸工作室 - 主进程
-const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, session, safeStorage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, session, safeStorage, screen,
+  Notification, globalShortcut } = require('electron');
+
+// ---- 关于高 DPI(结论:不要加 force-device-scale-factor) ----
+// 本机 125% 缩放,Chromium 正常按 dpr=1.25 原生渲染:窗口 1280×800 物理像素,
+// CSS 画布 1024×640。这是自洽的,没有位图拉伸,字不会糊。
+// 实测加 --force-device-scale-factor=1 会让渲染层按 1280×800 CSS 排版、
+// 却塞进 1024×640 的物理窗口,底部缩略带/命令条和右侧动作键被直接裁掉。
+// 所以这里一个 switch 都不加,保持系统默认。
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const { DEFAULT_CONFIG, buildRandomPrompt } = require('../shared/defaults');
+const logger = require('./logger');
+
+// 主进程兜底:未捕获异常/unhandledRejection 至少落一条日志,别只留在看不见的 stderr 里。
+// 注意 logger 未 init 时也只是打到控制台,不会抛。
+process.on('uncaughtException', (err) => {
+  try { logger.error('uncaughtException: ' + ((err && err.stack) || err)); } catch {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { logger.error('unhandledRejection: ' + ((reason && reason.stack) || reason)); } catch {}
+});
 const { stripBom } = require('../shared/text');
 const { ok, fail, failFrom, ERROR_CODES } = require('../shared/contracts');
 const { assertService, assertPreset, assertId, assertKind, assertReason, assertApiBase,
@@ -46,26 +64,59 @@ async function setWallpaper(p) {
   await wpModule.setWallpaper(p);
 }
 
+// ---------- 系统通知 ----------
+// 只在"用户不在界面前、但必须知道结果"的场合发:
+//   定时/快捷键换图失败、AI 生成完成或失败、快捷键切开关。
+// 定时换图成功不发 —— 半小时弹一次"换好了"是纯噪音,会让人想关掉通知。
+function notify(title, body) {
+  try {
+    if (!Notification.isSupported()) return;
+    // body 截断:某些平台对通知正文长度有限制,超了直接不显示
+    new Notification({ title: String(title), body: String(body || '').slice(0, 200) }).show();
+  } catch (err) {
+    try { logger.warn('notify 失败: ' + ((err && err.message) || err)); } catch {}
+  }
+}
+// 窗口在前台且聚焦时,用户自己看得见结果,再弹通知是打扰
+function notifyIfBackground(title, body) {
+  try {
+    if (win && !win.isDestroyed() && win.isFocused() && !win.isMinimized()) return;
+  } catch {}
+  notify(title, body);
+}
+
 // ---------- 模型列表缓存(避免 get-status 同步等待网络) ----------
-let modelsCache = { key: '', models: [] };
+// 三件事分开记:数据、数据何时拿到的、上次失败何时失败的。
+// 原实现只有 key+models,命中就 return —— 服务端加了新模型这台机器永远看不到。
+// 现在:有缓存先给界面用,过期了才在后台补一次;失败后退避,不搞连接风暴。
+const MODELS_TTL_MS = 6 * 60 * 60 * 1000;
+const MODELS_RETRY_GAP_MS = 30 * 60 * 1000;
+let modelsCache = { key: '', models: [], at: 0 };
 let modelsRefreshing = false;
-// 模型列表刷新失败的原因(空串=无错误)。刷新失败不再静默吞掉:
-// get-status 会把它一并返回,渲染层据此提示"模型列表获取失败",用户不必面对一个空下拉框猜原因。
 let modelsCacheError = '';
 let modelsCacheErrorNotified = false;
+let modelsFailKey = '';
+let modelsFailAt = 0;
 const imgSvcKey = (svc) => svc.id + '|' + apiBase(svc.apiBase);
-function refreshImageModels(svc) {
+function refreshImageModels(svc, force) {
   if (!svc || modelsRefreshing) return;
   const key = imgSvcKey(svc);
-  if (modelsCache.key === key) return;
+  const now = Date.now();
+  if (!force) {
+    if (modelsCache.key === key && modelsCache.at && (now - modelsCache.at) < MODELS_TTL_MS) return;
+    if (modelsFailKey === key && (now - modelsFailAt) < MODELS_RETRY_GAP_MS) return;
+  }
   modelsRefreshing = true;
   fetchServiceModels(svc).then((models) => {
-    modelsCache = { key, models };
+    modelsCache = { key, models, at: Date.now() };
+    modelsFailKey = '';
     modelsCacheError = '';
     modelsCacheErrorNotified = false;
     notifyUiRefresh('models');
   }).catch((e) => {
     // 只记录,不抛:这是后台刷新,不影响 get-status 的同步返回
+    modelsFailKey = key;
+    modelsFailAt = Date.now();
     modelsCacheError = (e && e.message) || String(e);
     // 只在"从无错误变为有错误"时推送一次,避免 UI 刷新与失败推送互相触发
     if (!modelsCacheErrorNotified) {
@@ -208,6 +259,49 @@ async function openDoubaoLoginWindow() {
         authManager.cancelLogin('用户关闭了登录窗口').catch(() => {});
       }
     });
+    // ---- 诊断用抓包钩子(仅本窗口,仅记录 URL/方法/body 前 300 字符,不含 cookie 与响应)----
+    // 目的:逆向两个网页端接口 —— 会话列表(当前 710020702)与无水印下载。
+    // 判据:请求路径命中 /samantha/、/api/、/alice/ 或含 conversation/download/watermark。
+    const CAPTURE_JS = `(function(){
+      if (window.__capHooked) return; window.__capHooked = true;
+      var HIT = /\\/samantha\\/|\\/api\\/|\\/alice\\/|conversation|download|watermark/i;
+      var emit = function(m){ try{ console.log('[CAPTURE] ' + m); }catch(e){} };
+      var of = window.fetch;
+      window.fetch = function(input, init){
+        try{
+          var url = (typeof input === 'string') ? input : ((input && input.url) || '');
+          var method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+          if (HIT.test(url)) {
+            var body = '';
+            if (init && init.body) body = (typeof init.body === 'string') ? init.body : '[non-string]';
+            emit(method + ' ' + url + (body ? ' BODY=' + body.slice(0, 300) : ''));
+          }
+        }catch(e){}
+        return of.apply(this, arguments);
+      };
+      var OX = window.XMLHttpRequest;
+      function H(){
+        var x = new OX();
+        try{
+          var op = x.open, sd = x.send;
+          x.open = function(m,u){ try{ x.__capUrl = String(u); if (HIT.test(x.__capUrl)) emit('XHR ' + m + ' ' + u); }catch(e){} return op.apply(x, arguments); };
+          x.send = function(b){ try{ if (b && HIT.test(String(x.__capUrl||''))) emit('XHR_BODY ' + String(b).slice(0,300)); }catch(e){} return sd.apply(x, arguments); };
+        }catch(e){}
+        return x;
+      }
+      window.XMLHttpRequest = H;
+    })();`;
+    doubaoLoginWin.webContents.on('did-finish-load', () => {
+      try { doubaoLoginWin.webContents.executeJavaScript(CAPTURE_JS, true).catch(() => {}); } catch {}
+    });
+    doubaoLoginWin.webContents.on('console-message', (...args) => {
+      // 兼容两种签名:旧版 (e, level, msg) / 新版 (e, details.message)
+      const raw = (args[1] && typeof args[1] === 'object' && args[1].message) || args[1];
+      if (typeof raw === 'string' && raw.indexOf('[CAPTURE]') === 0) {
+        try { logger.info('doubao-web-capture ' + raw.slice(7, 400)); } catch {}
+      }
+    });
+
     await doubaoLoginWin.loadURL(authProtocol.LOGIN_URL);
     return { ok: true };
   } catch (e) {
@@ -496,11 +590,17 @@ async function netFetch(url, opts = {}) {
   return fetch(url, opt);
 }
 
-// 连接失败转友好提示
-function netErr(e) {
-  const msg = e && e.message || String(e);
-  if (/fetch failed|ECONNREFUSED|ENOTFOUND|connect/i.test(msg)) {
-    return '无法连接到 ' + (e?.config?.url || '服务器') + ' — 请确认服务/网关已启动、端口正确';
+// 连接失败转友好提示。
+// 原来读 e?.config?.url —— 原生 fetch 的错误对象里没有 config,.url 恒为空,
+// 用户会看到"无法连接到 undefined"。改成由调用方把目标地址传进来。
+function netErr(e, url) {
+  const msg = (e && e.message) || String(e);
+  const target = url || '目标服务';
+  if (/SSL|TLS|handshake|certificate|self[- ]?signed|CERT/i.test(msg)) {
+    return '与 ' + target + ' 的 TLS 握手失败(常见原因:网络被阻断、DNS 污染,或该地址需要走代理)';
+  }
+  if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|connect|socket|abort/i.test(msg)) {
+    return '无法连接到 ' + target + '(服务/网关未启动、端口错误或网络不通)';
   }
   return msg;
 }
@@ -680,7 +780,17 @@ wallpaperService.init({
   sendRefresh: (reason) => { if (win && !win.isDestroyed()) win.webContents.send('ui-refresh', reason); },
 });
 
-const changeWallpaper = (reason) => wallpaperService.changeWallpaper(reason);
+// 定时/快捷键触发时没人在看界面,失败必须能听到响。
+// game-running 是正常跳过,不算失败,不通知。
+const changeWallpaper = async (reason) => {
+  const r = await wallpaperService.changeWallpaper(reason);
+  try {
+    if (r && r.ok === false && (reason === 'schedule' || reason === 'shortcut') && r.error !== 'game-running') {
+      notifyIfBackground('换壁纸失败', (r.error || '未知错误'));
+    }
+  } catch {}
+  return r;
+};
 const archiveCurrent = () => wallpaperService.archiveCurrent();
 const healInterruptedTransaction = () => wallpaperService.healInterruptedTransaction();
 const rollbackWallpaper = (tx) => wallpaperService.rollbackWallpaper(tx);
@@ -827,33 +937,29 @@ ipcMain.handle('ai-generate', async (e, rawPrompt) => {
   const finalPrompt = (typeof rawPrompt === 'string' && rawPrompt.trim())
     ? rawPrompt
     : (mode === 'custom' && cfg.ai.prompt ? cfg.ai.prompt : buildRandomPrompt(mode));
-  const id = taskService.beginTask('generate', 'AI 生图(预览)');
+  const id = taskService.beginTask('generate', 'AI 生图(入库)');
   taskService.stepTask(id, 'generate', 'running');
   try {
     const buf = await generateAiBuffer(cfg, finalPrompt);
     if (!buf || buf.length < 10240) throw new Error('生成的图片无效或过小');
-    taskService.stepTask(id, 'save-pending', 'running');
-    await fsp.mkdir(pendingDir(), { recursive: true });
-    // 一个用户同时至多一张待确认图:新任务覆盖旧 pending(先删 meta 再写文件,
-    // 读取方以 meta.json 存在且 image.jpg 可读为「有效 pending」判据)。
-    try { await fsp.unlink(path.join(pendingDir(), 'meta.json')); } catch {}
-    await fsp.writeFile(path.join(pendingDir(), 'image.jpg'), buf);
-    await writePendingMeta({ version: PENDING_META_VERSION, prompt: finalPrompt,
-      randomMode: mode, createdAt: Date.now(), taskId: id,
-      engine: (cfg.ai && cfg.ai.imageEngine) || 'service' });
-    taskService.stepTask(id, 'save-pending', 'done');
+    // 生成完直接进图库:不写 current.jpg、不调 setWallpaper —— 要不要当壁纸由用户在图库点。
+    const engineKey = (cfg.ai && cfg.ai.imageEngine) || 'service';
+    taskService.stepTask(id, 'archive', 'running');
+    const r = await wallpaperService.archiveBuffer(buf, {
+      source: engineKey === 'doubao' ? 'doubao' : 'service',
+      prompt: finalPrompt,
+      randomMode: mode,
+    });
+    if (!r || r.ok === false) throw new Error((r && r.error) || '写入图库失败');
+    taskService.stepTask(id, 'archive', 'done');
     taskService.endTask(id, true);
-    const st = await readPendingState();
-    // pendingPath:渲染层预览图要用 file:// 直读。路径属于本应用自己的 userData,
-    // 不含用户敏感数据;渲染层无法用它触达 pending 之外的任何文件(应用/放弃仍以 taskId 为准)。
-    return ok({ taskId: id, prompt: finalPrompt, bytes: buf.length, imageVersion: st.imageVersion,
-      pendingPath: pendingDir(),
-      engine: (cfg.ai && cfg.ai.imageEngine) || 'service' });
+    // 生成要等几十秒,用户很可能切走去干别的了 —— 完成时给一声
+    notifyIfBackground('AI 生图完成', '已存入图库,去「图库」点「设为壁纸」');
+    return ok({ taskId: id, prompt: finalPrompt, bytes: buf.length, fileName: r.fileName,
+      engine: engineKey, historyWriteError: r.historyWriteError || '' });
   } catch (err) {
     taskService.endTask(id, false, (err && err.message) || String(err));
-    // 生成失败:清掉可能已损坏的 pending,避免渲染层拿到半截文件
-    try { await fsp.unlink(path.join(pendingDir(), 'image.jpg')); } catch {}
-    try { await fsp.unlink(path.join(pendingDir(), 'meta.json')); } catch {}
+    notifyIfBackground('AI 生图失败', (err && err.message) || '未知错误');
     return failFrom(err, classifyError(err));
   }
 });
@@ -909,7 +1015,7 @@ ipcMain.handle('ai-pending-get', async () => {
   }
   return ok({ exists: true, imageVersion: st.imageVersion, bytes: st.bytes,
     prompt: st.prompt, createdAt: st.createdAt, taskId: meta.taskId || '',
-    pendingPath: pendingDir(),
+    pendingPath: path.join(pendingDir(), 'image.jpg'),
     engine: meta.engine || 'service', randomMode: meta.randomMode || '' });
 });
 // 只读通道的失败记录(阶段2 第5步)
@@ -929,14 +1035,69 @@ function clearReadError(channel) {
 
 ipcMain.handle('list-history', async () => {
   try {
-    const files = (await fsp.readdir(wallDir())).filter(f => f.endsWith('.jpg')).sort().reverse();
+    const files = (await fsp.readdir(wallDir())).filter(f => f.endsWith('.jpg'));
+    // history.jsonl 里每条归档记录带 histFile,拿它把"文件名 -> 提示词/来源/标题"串起来。
+    // 读不到或某条解析失败都不影响出图,只是那张图没有元信息(显示为 —)。
+    const metaByHist = new Map();
+    try {
+      const raw = stripBom(await fsp.readFile(path.join(wallDir(), 'history.jsonl'), 'utf8'));
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const r = JSON.parse(line);
+          if (r && r.histFile) metaByHist.set(r.histFile, r);
+        } catch {}
+      }
+    } catch {}
+    const list = await Promise.all(files.map(async (f) => {
+      const p = path.join(wallDir(), f);
+      let mtime = 0;
+      try { mtime = (await fsp.stat(p)).mtimeMs; } catch {}
+      const m = metaByHist.get(f) || null;
+      return {
+        name: f, path: p, mtime,
+        prompt: (m && m.prompt) || '',
+        source: (m && m.source) || '',
+        title: (m && m.title) || '',
+        tag: (m && m.tag) || '',
+      };
+    }));
+    // 按修改时间倒序:文件名里没有时间信息(老数据 hist_1.jpg),排序会乱
+    list.sort((a, b) => b.mtime - a.mtime);
     clearReadError('list-history');
-    return files.map(f => ({ name: f, path: path.join(wallDir(), f) }));
+    return list;
   } catch (err) {
     // 目录不存在属于"首次使用,还没有壁纸"的正常状态,不算错误
     if (err && err.code === 'ENOENT') { clearReadError('list-history'); return []; }
     noteReadError('list-history', err);
     return [];
+  }
+});
+ipcMain.handle('delete-history', async (e, rawName) => {
+  // 与 delete-favorite 同一套规范:assertId 只校验类型与长度,既不挡路径穿越也不挡扩展名,
+  // 而 wallDir() 里同时住着 history.jsonl / wallpaper_meta.json / current.jpg。
+  // 只靠 basename 会让 deleteHistory('history.jsonl') 抹掉全部历史元数据,
+  // 因此必须按归档的真实命名规则(hist_<ts>.jpg / hist_<ts>_1.jpg / 老数据 hist_1.jpg)做白名单。
+  let name;
+  try { name = assertId(rawName, '文件名'); } catch (err) { return argFail(err); }
+  if (name.includes('/') || name.includes('\\') || name.includes('..')) {
+    return fail('文件名不能包含路径分隔符或 ".."', ERROR_CODES.E_INVALID_ARG);
+  }
+  const safe = path.basename(name);
+  if (!/^hist_[A-Za-z0-9_-]+\.jpg$/i.test(safe)) {
+    return fail('只能删除归档的历史壁纸文件', ERROR_CODES.E_INVALID_ARG);
+  }
+  const p = path.join(wallDir(), safe);
+  // 双保险:确认最终路径确实落在壁纸目录内(文件名已白名单化,此处防御未来改动)
+  if (path.dirname(path.resolve(p)) !== path.resolve(wallDir())) {
+    return fail('历史文件路径不合法', ERROR_CODES.E_INVALID_ARG);
+  }
+  try {
+    if (!fs.existsSync(p)) return fail('文件不存在: ' + safe, ERROR_CODES.E_NOT_FOUND);
+    await fsp.unlink(p);
+    return ok();
+  } catch (err) {
+    return failFrom(err, ERROR_CODES.E_IO);
   }
 });
 ipcMain.handle('use-history', async (e, name) => {
@@ -1062,32 +1223,93 @@ ipcMain.handle('use-history', async (e, name) => {
     if (tray) buildTrayMenu();
   }
 });
+// A2:把"为什么画图可能失败"收敛成一条可渲染的结果,界面不再自己拼四种文案。
+// code 给机器判断,level 决定颜色(action 为空时不显示第二行。
+function buildImageIssue(cfg, imgSvc, models, err) {
+  const engine = (cfg.ai && cfg.ai.imageEngine) || 'service';
+  if (engine === 'doubao') {
+    let state = 'unknown';
+    try { state = authManager.getState().state; } catch {}
+    if (state !== 'authenticated') {
+      return {
+        code: 'NOT_LOGGED_IN', level: 'warn',
+        message: '画图引擎是豆包,但账号未登录 —— 现在点生成一定失败',
+        action: '在「豆包账号」里登录,或在本页把某个画图服务设为「使用」',
+      };
+    }
+    return {
+      code: 'OK_DOUBAO', level: 'info',
+      message: '画图走豆包 Seedream(个人账号,非官方接入)',
+      action: '',
+    };
+  }
+  if (!imgSvc) {
+    return {
+      code: 'NO_SERVICE', level: 'warn',
+      message: '当前画图引擎是 API 服务,但没有可用的画图服务',
+      action: '下面添加一个画图服务,或把引擎切回豆包',
+    };
+  }
+  if (err) {
+    return {
+      code: 'MODELS_UNREACHABLE', level: 'warn',
+      message: '模型列表拉取失败:' + err,
+      action: '点该行「拉取模型」重试;地址或密钥不通时会一直失败',
+    };
+  }
+  if (!models || !models.length) {
+    return {
+      code: 'NO_MODELS', level: 'warn',
+      message: '这个服务没返回任何模型,生成时可能直接报"模型不存在"',
+      action: '点「拉取模型」看它到底给不给模型列表',
+    };
+  }
+  return { code: 'OK', level: 'info', message: '', action: '' };
+}
+
 ipcMain.handle('get-status', async () => {
   const cfg = await loadConfig();
   let nextRun = null;
   if (cfg.schedule.enabled && scheduler.isRunning()) {
-    nextRun = new Date(Date.now() + cfg.schedule.intervalMinutes * 60000).toLocaleTimeString('zh-CN', { hour12: false });
+    // 下次换图 = 上次写入壁纸的时间 + 间隔。
+    // 原实现用 Date.now()+间隔:每次 get-status 都往后推,渲染层看到的"下次"永远是"现在+间隔",
+    // 倒计时不动,像是假数据。改成基于壁纸文件 mtime,时间才稳定。
+    let baseMs = Date.now();
+    try {
+      const st = fs.statSync(currentPath());
+      if (st && st.mtimeMs) baseMs = st.mtimeMs;
+    } catch {}
+    const nextMs = Math.max(baseMs + cfg.schedule.intervalMinutes * 60000, Date.now());
+    nextRun = new Date(nextMs).toLocaleTimeString('zh-CN', { hour12: false });
   }
   let currentPathStr = null;
   try { if (fs.existsSync(currentPath())) currentPathStr = currentPath(); } catch {}
-  const imgSvc = findService(cfg, cfg.activeImageService);
+  // 只认 kind=image 的服务:配置被手改/通道被误调时,不能拿一个文本服务去拉图模型
+  const imgSvcRaw = findService(cfg, cfg.activeImageService);
+  const imgSvc = (imgSvcRaw && imgSvcRaw.kind === 'image') ? imgSvcRaw : null;
   const meta = await readWallpaperMeta();
   // 模型列表走缓存,后台异步刷新;本函数不等待网络
   let imageModels = [];
-  let imageModelsError = '';
   if (imgSvc) {
-    if (modelsCache.key === imgSvcKey(imgSvc)) {
+    const cacheKey = imgSvcKey(imgSvc);
+    if (modelsCache.key === cacheKey && modelsCache.models.length) {
+      // 有缓存立刻给界面用,不等网络;过期了才在后台补一次
       imageModels = modelsCache.models;
+      if (!modelsCache.at || (Date.now() - modelsCache.at) > MODELS_TTL_MS) refreshImageModels(imgSvc);
     } else {
       refreshImageModels(imgSvc);
-      // 已缓存的失败原因(首次拉取失败后 modelsCache.key 仍为空,每次 get-status 都会走到这里)
-      imageModelsError = modelsCacheError;
     }
   }
+  // 失败原因无条件带出:原来只在"缓存未命中"分支返回,导致缓存成功过之后
+  // 再失败(比如手动刷新失败)界面上看不到任何原因。
+  const imageModelsError = modelsCacheError || '';
+  // 统一诊断结果:界面只渲染这个对象(imageIssue)
+  const imageIssue = buildImageIssue(cfg, imgSvc, imageModels, imageModelsError);
   return {
     lastInfo, nextRun, currentPath: currentPathStr,
     // 模型列表获取失败的原因(空串=无错误),渲染层据此给出明确提示,而不是只显示一个空下拉框
     imageModelsError,
+    imageIssue,
     // 只读通道的读取失败原因(阶段2 第5步)。
     // 空对象=无错误。渲染层可据此区分"磁盘读不了"与"本来就没数据",
     // 而不必改变各通道的返回形状(那样要动 17 处调用与 42 处断言)。
@@ -1158,9 +1380,37 @@ ipcMain.handle('query-old-task', async () => {
 });
 ipcMain.handle('win-minimize', () => win.minimize());
 ipcMain.handle('win-close', () => win.hide()); // 关闭=隐藏到托盘
+ipcMain.handle('win-maximize', () => {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMaximized()) win.unmaximize(); else win.maximize();
+});
+ipcMain.handle('open-log-dir', async () => {
+  const d = logger.dir();
+  if (!d) return { ok: false, error: '日志目录未初始化' };
+  const r = await shell.openPath(d);
+  return r ? { ok: false, error: r, dir: d } : { ok: true, dir: d };
+});
 
 // ---------- API 服务管理 ----------
-ipcMain.handle('list-services', async () => (await loadConfig()).services || []);
+// 渲染层不再持有密钥:调用方传空 key 时,按 id 从配置里补回来
+async function fillServiceKey(svc) {
+  if (!svc || svc.apiKey) return svc;
+  const saved = findService(await loadConfig(), svc.id);
+  if (saved && saved.apiKey) svc.apiKey = saved.apiKey;
+  return svc;
+}
+ipcMain.handle('list-services', async () => {
+  // 列表不回传密钥:渲染层只需要 id/kind/名称/地址/模型。
+  // 编辑器要回显密钥时走 service-key 单独取,把"密钥在渲染层常驻"这个面收窄。
+  return ((await loadConfig()).services || []).map(s => ({ ...s, apiKey: '' }));
+});
+ipcMain.handle('service-key', async (e, rawId) => {
+  let id;
+  try { id = assertId(rawId, '服务 id'); } catch (err) { return argFail(err); }
+  const svc = findService(await loadConfig(), id);
+  if (!svc) return fail('服务不存在', ERROR_CODES.E_NOT_FOUND);
+  return { ok: true, apiKey: svc.apiKey || '' };
+});
 ipcMain.handle('save-service', async (e, rawSvc) => {
   // 服务对象整体来自渲染层,必须逐字段校验后才能落盘(否则可写入任意字段与超大值)
   let svc;
@@ -1172,7 +1422,12 @@ ipcMain.handle('save-service', async (e, rawSvc) => {
   const cfg = await loadConfig();
   const list = cfg.services || [];
   const i = list.findIndex(s => s.id === svc.id);
-  if (i >= 0) list[i] = svc; else list.push(svc);
+  if (i >= 0) {
+    // 渲染层拿到的服务对象已经不带密钥(列表脱敏)。空 key 表示"沿用原密钥",
+    // 不是"把密钥清空" —— 否则改个模型名就把 key 弄丢了。
+    if (!svc.apiKey && list[i].apiKey) svc.apiKey = list[i].apiKey;
+    list[i] = svc;
+  } else list.push(svc);
   await saveConfig({ services: list });
   return { ok: true };
 });
@@ -1186,10 +1441,20 @@ ipcMain.handle('delete-service', async (e, rawId) => {
   const cfg = await loadConfig();
   const list = (cfg.services || []).filter(s => s.id !== id);
   const patch = { services: list };
-  if (cfg.activeImageService === id) patch.activeImageService = list.find(s => s.kind === 'image')?.id || '';
+  let fellBackToDoubao = false;
+  if (cfg.activeImageService === id) {
+    const next = list.find(s => s.kind === 'image');
+    patch.activeImageService = next ? next.id : '';
+    // 画图服务删光了、引擎还停在 'service' = 悬空状态,点生成只会得到一句含糊的失败。
+    // 强制回落豆包,并把这个事实带回界面
+    if (!next && (cfg.ai && cfg.ai.imageEngine) === 'service') {
+      patch.ai = { ...cfg.ai, imageEngine: 'doubao' };
+      fellBackToDoubao = true;
+    }
+  }
   if (cfg.activeTextService === id) patch.activeTextService = '';
   await saveConfig(patch);
-  return { ok: true };
+  return { ok: true, fellBackToDoubao };
 });
 ipcMain.handle('set-active-service', async (e, rawKind, rawId) => {
   // id 允许空串:那是"取消当前服务"的既有语义,不能当非法入参拦掉
@@ -1199,6 +1464,21 @@ ipcMain.handle('set-active-service', async (e, rawKind, rawId) => {
     id = assertId(rawId, '服务 id', { allowEmpty: true });
   } catch (err) {
     return argFail(err);
+  }
+  // id 非空时必须真的存在,且类型要对得上 —— 否则 activeImageService 里会躺着一个文本服务,
+  // 之后每次拉模型都用错对象,还会给出莫名其妙的失败文案。
+  // 例外:builtin:doubao 是内置豆包文本模型,本来就不在 services 数组里,按 id 直接放行。
+  if (id && kind === 'text' && id === 'builtin:doubao') {
+    await saveConfig({ activeTextService: id });
+    return { ok: true };
+  }
+  if (id) {
+    const cfg = await loadConfig();
+    const svc = findService(cfg, id);
+    if (!svc) return fail('服务不存在: ' + id, ERROR_CODES.E_NOT_FOUND);
+    if (svc.kind !== kind) {
+      return fail('服务类型不匹配:该服务是 ' + svc.kind + ',不能设为 ' + kind, ERROR_CODES.E_INVALID_ARG);
+    }
   }
   if (kind === 'image') await saveConfig({ activeImageService: id });
   else await saveConfig({ activeTextService: id });
@@ -1214,6 +1494,7 @@ ipcMain.handle('test-service', async (e, rawSvc) => {
   } catch (err) {
     return argFail(err);
   }
+  await fillServiceKey(svc);
   try {
     const base = apiBase(svc.apiBase);
     if (svc.kind === 'text') {
@@ -1242,14 +1523,15 @@ ipcMain.handle('test-service', async (e, rawSvc) => {
 // 拉取服务的可用模型列表(内部复用)
 async function fetchServiceModels(svc) {
   const base = apiBase(svc.apiBase);
+  const url = base + '/v1/models';
   let res;
   try {
-    res = await netFetch(base + '/v1/models', {
+    res = await netFetch(url, {
       headers: { 'Authorization': 'Bearer ' + svc.apiKey },
       signal: AbortSignal.timeout(20000),
     });
-  } catch (e) { throw new Error(netErr(e)); }
-  if (!res.ok) throw new Error('HTTP ' + res.status);
+  } catch (e) { throw new Error(netErr(e, url)); }
+  if (!res.ok) throw new Error('HTTP ' + res.status + '(' + url + ')');
   const data = await res.json();
   return (data.data || []).map(m => m.id).filter(Boolean);
 }
@@ -1262,9 +1544,22 @@ ipcMain.handle('fetch-models', async (e, rawSvc) => {
   } catch (err) {
     return argFail(err);
   }
+  await fillServiceKey(svc);
   try {
-    return { ok: true, models: await fetchServiceModels(svc) };
+    const models = await fetchServiceModels(svc);
+    // 手动拉到的列表必须写回缓存:否则渲染层刷完下拉,下一次 get-status
+    // 仍返回旧缓存(往往为空),20 秒轮询就把用户刚拉到的模型冲掉 —— 表现为"刷新没用"。
+    modelsCache = { key: imgSvcKey(svc), models, at: Date.now() };
+    modelsFailKey = '';
+    modelsCacheError = '';
+    modelsCacheErrorNotified = false;
+    notifyUiRefresh('models');
+    return { ok: true, models };
   } catch (err) {
+    // 失败原因同样写进缓存,让 get-status 能持续把它带给界面,而不是只弹一次 toast
+    logger.warn('fetch-models 失败: ' + err.message, { svc: svc.id, base: apiBase(svc.apiBase) });
+    modelsCacheError = err.message;
+    notifyUiRefresh('models');
     return { ok: false, error: err.message };
   }
 });
@@ -1278,22 +1573,52 @@ ipcMain.handle('roll-random-prompt', async (e, mode) => {
   try { m = assertRandomMode(mode); } catch (err) { return argFail(err); }
   return { prompt: buildRandomPrompt(m) };
 });
+// 本地兜底提示词:主题 + 标签池随机元素 + 风格池。文本模型不可用时也能出图。
+// 注意 pick 里的 slice():原来是直接 arr.sort(),会把共享的 STYLE_POOL 原地打乱。
+function buildLocalPrompt(theme, tags) {
+  const { STYLE_POOL } = require('../shared/defaults');
+  const pick = (arr, n) => arr.slice().sort(() => Math.random() - 0.5).slice(0, n);
+  const parts = [];
+  if (theme) parts.push(theme);
+  const tagArr = tags ? String(tags).split(', ') : [];
+  if (Math.random() < 0.6 && tagArr.length) parts.push(tagArr[Math.floor(Math.random() * tagArr.length)]);
+  parts.push(...pick(STYLE_POOL.scene, 1), ...pick(STYLE_POOL.lighting, 1), ...pick(STYLE_POOL.atmosphere, 1), ...pick(STYLE_POOL.quality, 2));
+  return parts.join(', ');
+}
+
 ipcMain.handle('ai-assist-prompt', async (e, userTheme) => {
   // 主题会整段拼进系统提示词,必须先限长,避免超长内容直通远端模型
   let theme;
   try { theme = assertTheme(userTheme); } catch (err) { return argFail(err); }
   const cfg = await loadConfig();
   const tags = (cfg.lolicon.tags || []).join(', ');
+  // 引擎可以是内置豆包文本模型(activeTextService='builtin:doubao'):
+  // 它不在 services 数组里,所以不能只靠 findService 判断。
+  if (cfg.activeTextService === 'builtin:doubao') {
+    const denied = requireDoubaoRisk();
+    if (denied) return denied;
+    const dcfg = cfg.doubao || {};
+    try {
+      const r = await requestDoubaoTurn({
+        prompt: '你是二次元壁纸提示词专家。把用户给的主题扩写成高质量英文 Danbooru 标签串(逗号分隔,含画质/构图/光线/场景词),只输出标签串,不要任何解释。主题:' +
+          (theme || '随机来一张好看的壁纸'),
+        isImage: false,
+        modelKey: dcfg.textModel,
+        reasoningEffort: dcfg.reasoningEffort,
+        timeoutMs: 90000,
+      });
+      const out = String(r.text || '').replace(/[\r\n]+/g, ' ').trim();
+      if (!out) throw new Error('豆包返回内容为空');
+      return { ok: true, prompt: out, engine: 'doubao' };
+    } catch (err) {
+      // 和 API 服务同款兜底:扩写挂了就回落本地词池,把原因带回去让界面说明
+      return { ok: true, prompt: buildLocalPrompt(theme, tags), local: true,
+        warning: '豆包扩写失败,已改用本地词池: ' + doubaoProvider.humanize(err) };
+    }
+  }
   const textSvc = findService(cfg, cfg.activeTextService);
   if (!textSvc) {
-    // 本地兜底:主题词 + 标签池元素 + 随机风格增强
-    const { STYLE_POOL } = require('../shared/defaults');
-    const pick = (arr, n) => arr.sort(() => Math.random() - 0.5).slice(0, n);
-    const parts = [];
-    if (theme) parts.push(theme);
-    if (Math.random() < 0.6 && tags) parts.push(tags.split(', ')[Math.floor(Math.random() * tags.split(', ').length)]);
-    parts.push(...pick(STYLE_POOL.scene, 1), ...pick(STYLE_POOL.lighting, 1), ...pick(STYLE_POOL.atmosphere, 1), ...pick(STYLE_POOL.quality, 2));
-    return { ok: true, prompt: parts.join(', '), local: true };
+    return { ok: true, prompt: buildLocalPrompt(theme, tags), local: true };
   }
   try {
     // 阶段2起实现迁移到 plugins/builtin/openai-text-provider.js
@@ -1312,7 +1637,14 @@ ipcMain.handle('ai-assist-prompt', async (e, userTheme) => {
       ],
     });
   } catch (err) {
-    return { ok: false, error: err.message };
+    // 文本服务挂了不该让整条链路卡死:回落本地词池,并把原因带回去让界面说明。
+    // 本地兜底本来就有,没理由因为一个远端服务离线而"生成提示词"直接失败。
+    return {
+      ok: true,
+      prompt: buildLocalPrompt(theme, tags),
+      local: true,
+      warning: '文本模型调用失败,已改用本地词池: ' + ((err && err.message) || err),
+    };
   }
 });
 
@@ -1391,6 +1723,8 @@ ipcMain.handle('doubao-session-status', async () => {
     invalid: !!(b && b.defunct),
     createdAt: live ? b.createdAt : 0,
     lastUsedAt: live ? b.lastUsedAt : 0,
+    // 只给后 8 位,用来让用户辨认"还是不是同一个会话";完整 conversationId 不出主进程
+    sessionTag: live && b.conversationId ? String(b.conversationId).slice(-8) : '',
     loggedOut: !(await credentialService.has().catch(() => false)),
   };
 });
@@ -1403,6 +1737,142 @@ ipcMain.handle('doubao-new-session', async () => {
   const accountKey = await currentAccountKey();
   const r = await sessionService.newSession(accountKey);
   return ok({ generation: r.generation });
+});
+
+// 绑定已有会话:把用户自己的豆包会话(网页链接或裸 ID)挂到当前账号。
+// ID 只进不出 —— 绑定后状态通道仍只回后 8 位,渲染层拿不到完整 ID。
+// 不消耗额度,所以不走风险确认;但必须已登录(没 accountKey 就无法归属到账号)。
+ipcMain.handle('doubao-bind-session', async (e, rawInput) => {
+  if (typeof rawInput !== 'string' || !rawInput.trim()) {
+    return fail('请输入豆包会话链接或会话 ID', ERROR_CODES.E_INVALID_ARG);
+  }
+  if (rawInput.length > 512) return fail('输入过长', ERROR_CODES.E_INVALID_ARG);
+  const input = rawInput.trim();
+  // 从 .../chat/<id> 取 ID,也接受裸 ID。字符集白名单,避免把路径片段当 ID 存进去。
+  let id = input;
+  const m = input.match(/\/chat\/([A-Za-z0-9_-]{6,80})/);
+  if (m) id = m[1];
+  if (!/^[A-Za-z0-9_-]{6,80}$/.test(id)) {
+    return fail('不是有效的会话链接或 ID:应形如 https://www.doubao.com/chat/xxxxxx', ERROR_CODES.E_INVALID_ARG);
+  }
+  const accountKey = await currentAccountKey();
+  if (!accountKey) return fail('请先登录豆包,再绑定会话', ERROR_CODES.E_STATE);
+  await sessionService.reconcileAccount(accountKey);
+  const cur = sessionService.getBinding();
+  const gen = cur ? cur.generation : 0;
+  const r = await sessionService.setBinding({ conversationId: id, accountKey, expectedGeneration: gen });
+  if (!r || r.ok === false) {
+    return fail('绑定失败: ' + ((r && r.reason) || '未知原因'), ERROR_CODES.E_STATE);
+  }
+  return ok({ sessionTag: id.slice(-8) });
+});
+
+// ---------- 账号会话列表(方案B) ----------
+// 走豆包非公开接口 POST /samantha/conversation/list。已实测该端点存在(未登录时返回
+// code 710012001 结构化 JSON,不是 404),但它属于未公开接口,改版就会失效 ——
+// 失败时只回原因、不抛异常,绑定会话仍可走「粘贴链接」那条路。
+//
+// 完整 conversationId 只留在主进程:列表只回 {index,title,tag},选中时用 index
+// 回到这张内存表取 ID,渲染层始终拿不到完整 ID(沿用状态通道的既有约束)。
+let convListCache = [];
+
+function normalizeConvList(arr) {
+  const out = [];
+  for (const it of arr) {
+    if (!it || typeof it !== 'object') continue;
+    const id = it.conversation_id || it.conversationId || it.conv_id || it.id || '';
+    if (!id || typeof id !== 'string') continue;
+    const title = it.title || it.name || it.conversation_name || it.summary || it.conv_title || '';
+    const updatedAt = Number(it.update_time || it.updated_at || it.modify_time || it.last_message_time || 0) || 0;
+    out.push({ id, title: String(title || '(无标题)'), updatedAt });
+  }
+  return out;
+}
+
+// 响应结构可能与现在不同(改版),因此按"常见字段 + 递归兜底"两层找会话数组
+function findConvArray(node, depth) {
+  if (!node || depth > 4) return null;
+  if (Array.isArray(node)) {
+    const norm = normalizeConvList(node);
+    if (norm.length) return norm;
+    for (const it of node) {
+      const r = findConvArray(it, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+  if (typeof node === 'object') {
+    for (const v of Object.values(node)) {
+      const r = findConvArray(v, depth + 1);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+ipcMain.handle('doubao-conversation-list', async () => {
+  const denied = requireDoubaoRisk();
+  if (denied) return denied;
+  let cookie = '';
+  try { cookie = await credentialService.getCookieHeader(); } catch (e) {
+    return fail('读取登录凭据失败: ' + ((e && e.message) || e), ERROR_CODES.E_STATE);
+  }
+  if (!cookie) return fail('尚未登录豆包,请先扫码登录', ERROR_CODES.E_STATE);
+  try {
+    const res = await netFetch('https://www.doubao.com/samantha/conversation/list', {
+      method: 'POST',
+      headers: doubaoTransport.buildHeaders(cookie),
+      body: JSON.stringify({ cursor: '0', count: 20 }),
+      signal: AbortSignal.timeout(20000),
+    });
+    const txt = await res.text();
+    // 先记录原始响应再解析:解析失败时也要留下 status/类型/前 300 字符,否则只能看到一句"可能已改版"
+    logger.info('conversation-list status=' + res.status +
+      ' ct=' + (res.headers && res.headers.get ? (res.headers.get('content-type') || '') : '') +
+      ' raw=' + String(txt).slice(0, 300).replace(/\s+/g, ' '));
+    let json;
+    try { json = JSON.parse(txt); } catch {
+      return fail('会话列表返回的不是 JSON(HTTP ' + res.status + ',原始响应已记入日志)', ERROR_CODES.E_NET);
+    }
+    if (json && json.code && json.code !== 0) {
+      const why = json.msg || json.message || ('code ' + json.code);
+      // 实测:该端点带正确 cookie 后稳定返回 710020702「系统错误」,
+      // 说明它还要网页端的签名参数,应用内伪造不出来。别让用户误以为是登录问题。
+      return fail('豆包返回「' + why + '」:这条接口要求网页端的签名参数,应用内取不到。请改用上面的「粘贴会话链接」绑定。',
+        ERROR_CODES.E_NET);
+    }
+    const list = findConvArray(json, 0);
+    if (!list) return fail('没能识别会话列表结构,接口可能已改版(原始响应已记入日志)', ERROR_CODES.E_NET);
+    convListCache = list;
+    return ok({
+      items: list.map((c, i) => ({
+        index: i,
+        title: c.title,
+        tag: String(c.id).slice(-8),
+        updatedAt: c.updatedAt,
+      })),
+    });
+  } catch (e) {
+    return fail('拉取会话列表失败: ' + ((e && e.message) || e), ERROR_CODES.E_NET);
+  }
+});
+
+ipcMain.handle('doubao-conversation-select', async (e, rawIndex) => {
+  const i = Number(rawIndex);
+  if (!Number.isInteger(i) || i < 0 || i >= convListCache.length) {
+    return fail('无效的会话序号,请重新拉取列表', ERROR_CODES.E_INVALID_ARG);
+  }
+  const accountKey = await currentAccountKey();
+  if (!accountKey) return fail('请先登录豆包,再绑定会话', ERROR_CODES.E_STATE);
+  await sessionService.reconcileAccount(accountKey);
+  const cur = sessionService.getBinding();
+  const gen = cur ? cur.generation : 0;
+  const item = convListCache[i];
+  const r = await sessionService.setBinding({ conversationId: item.id, accountKey, expectedGeneration: gen });
+  if (!r || r.ok === false) {
+    return fail('绑定失败: ' + ((r && r.reason) || '未知原因'), ERROR_CODES.E_STATE);
+  }
+  return ok({ sessionTag: String(item.id).slice(-8), title: item.title });
 });
 
 // ---------- 豆包风险确认(主进程统一把关) ----------
@@ -1500,6 +1970,12 @@ ipcMain.handle('doubao-risk-accepted', async () => ({ accepted: hasAcceptedDouba
 ipcMain.handle('doubao-accept-risk', async (e, accepted) => {
   if (typeof accepted !== 'boolean') return fail('参数必须是布尔值', ERROR_CODES.E_INVALID_ARG);
   hasAcceptedDoubaoRisk = accepted;
+  // 必须落盘:原来只改内存,重启后所有消耗额度的入口都会消失(豆包卡只剩「退出账号」)
+  try {
+    await saveConfig({ doubao: { riskAccepted: accepted } });
+  } catch (err) {
+    return fail('保存风险确认状态失败: ' + ((err && err.message) || err), ERROR_CODES.E_IO);
+  }
   return ok({ accepted });
 });
 
@@ -1744,15 +2220,57 @@ ipcMain.handle('read-meta', async (e, rawFileName) => {
 });
 
 // ---------- 窗口与生命周期 ----------
-function createWindow() {
+async function createWindow() {
+  const wa = screen.getPrimaryDisplay().workArea;
+  // 默认画幅 1280×800,上限按工作区尺寸算(留 16px 余量),小屏/高 DPI 上不会超出可用区。
+  const defW = Math.max(900, Math.min(1280, wa.width - 16));
+  const defH = Math.max(640, Math.min(800, wa.height - 16));
+
+  // 复原上次的位置与大小。换过显示器/改过缩放时旧坐标可能已不在可见区,
+  // 越界就交回 Electron 居中,而不是把窗口丢到屏幕外找不回来。
+  let saved = null;
+  try { const c = await loadConfig(); saved = (c && c.win) || null; } catch {}
+  let width = defW, height = defH, x, y;
+  if (saved && Number.isFinite(saved.width) && saved.width >= 900
+      && Number.isFinite(saved.height) && saved.height >= 640) {
+    width = Math.min(saved.width, wa.width);
+    height = Math.min(saved.height, wa.height);
+  }
+  if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+    const okX = saved.x > wa.x - width + 240 && saved.x < wa.x + wa.width - 240;
+    const okY = saved.y > wa.y - 100 && saved.y < wa.y + wa.height - 100;
+    if (okX) x = saved.x;
+    if (okY) y = saved.y;
+  }
+
   win = new BrowserWindow({
-    width: 900, height: 640, minWidth: 800, minHeight: 560,
+    width, height,
+    ...(x !== undefined ? { x } : {}),
+    ...(y !== undefined ? { y } : {}),
+    minWidth: 900, minHeight: 640,
     frame: false, backgroundColor: '#14161c', show: false, icon: path.join(__dirname, '../../assets/icon.png'),
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
   });
+  if (saved && saved.maximized) win.maximize();
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
   win.once('ready-to-show', () => win.show());
   win.on('closed', () => { win = null; });
+
+  // 位置/大小变了就防抖写回。最大化时记的是"还原后"的尺寸,下次启动才能正确还原。
+  let boundsTimer = null;
+  const persistBounds = () => {
+    if (!win || win.isDestroyed()) return;
+    try {
+      const b = win.isMaximized() ? win.getNormalBounds() : win.getBounds();
+      saveConfig({ win: { x: b.x, y: b.y, width: b.width, height: b.height, maximized: win.isMaximized() } })
+        .catch(() => {});
+    } catch {}
+  };
+  const schedulePersist = () => { clearTimeout(boundsTimer); boundsTimer = setTimeout(persistBounds, 500); };
+  win.on('resize', schedulePersist);
+  win.on('move', schedulePersist);
+  win.on('maximize', schedulePersist);
+  win.on('unmaximize', schedulePersist);
 }
 
 // 单实例锁:进程内的 changing 互斥锁挡不住第二个进程。
@@ -1771,10 +2289,17 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(async () => {
-    createWindow();
+    logger.init(app.getPath('userData'));
+    await createWindow();
     tray = new Tray(trayIcon());
     buildTrayMenu();
+    registerGlobalShortcuts();
     applySchedule(await loadConfig());
+    // 风险确认跨重启恢复:不恢复的话,重启后豆包卡只剩「退出账号」,测试/新建会话入口全消失
+    try {
+      const bootCfg = await loadConfig();
+      hasAcceptedDoubaoRisk = !!(bootCfg.doubao && bootCfg.doubao.riskAccepted);
+    } catch {}
     await ensureDir();
     // 启动自愈:修复上次异常退出(断电/强杀)遗留的 current 缺失
     // 必须在 startWatcher 之前,避免自愈写入触发"旧脚本换图"误报
@@ -1805,5 +2330,31 @@ if (!app.requestSingleInstanceLock()) {
   });
 }
 
+// ---------- 全局快捷键 ----------
+// 注册失败(被其他软件占用)不致命:只记日志,应用照常用。
+// 换图走和 IPC 同一条 changeWallpaper,不另开一条路径,避免两套行为。
+async function toggleScheduleQuick() {
+  const cfg = await loadConfig();
+  const on = !cfg.schedule.enabled;
+  await saveConfig({ schedule: { enabled: on } });
+  notify('自动换图', on
+    ? '已开启,每 ' + cfg.schedule.intervalMinutes + ' 分钟换一张'
+    : '已暂停自动换图');
+  return on;
+}
+function registerGlobalShortcuts() {
+  const bind = (accel, fn, label) => {
+    try {
+      if (!globalShortcut.register(accel, fn)) logger.warn('快捷键被占用: ' + accel + ' (' + label + ')');
+    } catch (err) {
+      logger.warn('快捷键注册失败 ' + accel + ': ' + ((err && err.message) || err));
+    }
+  };
+  bind('Control+Alt+N', () => { if (!changing) changeWallpaper('shortcut'); }, '立即换一张');
+  bind('Control+Alt+P', () => { toggleScheduleQuick().catch(() => {}); }, '暂停/继续自动换图');
+}
+
 app.on('window-all-closed', () => { /* 保持托盘运行,不退出 */ });
+// 快捷键是全局资源,不注销会在进程退出后仍占用,导致下次启动注册失败
+app.on('will-quit', () => { try { globalShortcut.unregisterAll(); } catch {} });
 app.on('before-quit', () => { scheduler.stop(); });

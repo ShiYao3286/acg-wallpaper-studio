@@ -3,11 +3,13 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('api', {
   getConfig: () => ipcRenderer.invoke('get-config'),
   saveConfig: (key, val) => ipcRenderer.invoke('save-config', key, val),
-  changeWallpaper: (reason) => ipcRenderer.invoke('change-wallpaper', reason),  aiGenerate: (prompt) => ipcRenderer.invoke('ai-generate', prompt),
+  changeWallpaper: (reason) => ipcRenderer.invoke('change-wallpaper', reason),
+  aiGenerate: (prompt) => ipcRenderer.invoke('ai-generate', prompt),
   aiApply: (taskId) => ipcRenderer.invoke('ai-apply', taskId),
   aiDiscard: (taskId) => ipcRenderer.invoke('ai-discard', taskId),
   aiPendingGet: () => ipcRenderer.invoke('ai-pending-get'),
   listHistory: () => ipcRenderer.invoke('list-history'),
+  deleteHistory: (name) => ipcRenderer.invoke('delete-history', name),
   useHistory: (name) => ipcRenderer.invoke('use-history', name),
   getStatus: () => ipcRenderer.invoke('get-status'),
   getAutoRun: () => ipcRenderer.invoke('get-autorun'),
@@ -18,6 +20,7 @@ contextBridge.exposeInMainWorld('api', {
   disableOldTask: () => ipcRenderer.invoke('disable-old-task'),
   // API 服务
   listServices: () => ipcRenderer.invoke('list-services'),
+  serviceKey: (id) => ipcRenderer.invoke('service-key', id),
   saveService: (svc) => ipcRenderer.invoke('save-service', svc),
   deleteService: (id) => ipcRenderer.invoke('delete-service', id),
   setActiveService: (kind, id) => ipcRenderer.invoke('set-active-service', kind, id),
@@ -42,6 +45,8 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('ui-refresh', handler);
   },
   queryOldTask: () => ipcRenderer.invoke('query-old-task'),
+  // 日志目录(排查问题用)
+  openLogDir: () => ipcRenderer.invoke('open-log-dir'),
   // 插件管理(阶段2):listPlugins 返回元数据,不含实现对象
   listPlugins: () => ipcRenderer.invoke('list-plugins'),
   setPluginEnabled: (id, on) => ipcRenderer.invoke('set-plugin-enabled', id, on),
@@ -54,6 +59,9 @@ contextBridge.exposeInMainWorld('api', {
     openLoginWindow: () => ipcRenderer.invoke('doubao-open-login-window'),
   sessionStatus: () => ipcRenderer.invoke('doubao-session-status'),
   newSession: () => ipcRenderer.invoke('doubao-new-session'),
+  bindSession: (input) => ipcRenderer.invoke('doubao-bind-session', input),
+  conversationList: () => ipcRenderer.invoke('doubao-conversation-list'),
+  conversationSelect: (index) => ipcRenderer.invoke('doubao-conversation-select', index),
     riskAccepted: () => ipcRenderer.invoke('doubao-risk-accepted'),
     acceptRisk: (accepted) => ipcRenderer.invoke('doubao-accept-risk', accepted),
     testText: (prompt) => ipcRenderer.invoke('doubao-test-text', prompt),
@@ -64,5 +72,6 @@ contextBridge.exposeInMainWorld('api', {
   win: {
     minimize: () => ipcRenderer.invoke('win-minimize'),
     close: () => ipcRenderer.invoke('win-close'),
+    maximize: () => ipcRenderer.invoke('win-maximize'),
   },
 });

@@ -23,6 +23,8 @@ const meta = {
 
 // 规范化 API 地址:去掉尾部斜杠与多余的 /v1,统一由拼接处补 /v1/...
 // 与 main.js 的 apiBase() 保持完全一致 —— 两处实现若漂移会导致请求路径不同。
+const { assertImage } = require('../../../shared/image-sniff');
+
 function apiBase(url) {
   return String(url || '').trim().replace(/\/+$/, '').replace(/\/v1$/, '');
 }
@@ -46,13 +48,17 @@ async function generate(ctx) {
   const json = await res.json();
   const item = json.data && json.data[0];
   if (!item) throw new Error('AI API 未返回数据');
-  if (item.b64_json) return { buffer: Buffer.from(item.b64_json, 'base64') };
-  if (item.url) {
+  let out = null;
+  if (item.b64_json) out = { buffer: Buffer.from(item.b64_json, 'base64') };
+  else if (item.url) {
     const r2 = await ctx.netFetch(item.url, { signal: AbortSignal.timeout(60000) });
     if (!r2.ok) throw new Error('下载 AI 图片失败 HTTP ' + r2.status);
-    return { buffer: Buffer.from(await r2.arrayBuffer()) };
+    out = { buffer: Buffer.from(await r2.arrayBuffer()) };
   }
-  throw new Error('AI API 响应中无图片');
+  if (!out) throw new Error('AI API 响应中无图片');
+  // 早失败:别等落到壁纸目录才发现拿回来的是一张 HTML
+  assertImage(out.buffer);
+  return out;
 }
 
 module.exports = { ...meta, generate, apiBase };

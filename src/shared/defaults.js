@@ -35,6 +35,8 @@ const DEFAULT_CONFIG = {
     { id: 'preset-1', name: '风景系', prompt: 'anime wallpaper, scenic landscape, clouds, sunset sky, wide angle, detailed background, no humans, high quality' },
     { id: 'preset-2', name: '人物系', prompt: '1girl, solo, long hair, looking at viewer, detailed, beautiful, anime wallpaper, soft lighting' },
   ],
+  // 窗口位置/大小。0 或 null 表示"还没记过",启动时用默认画幅。
+  win: { x: null, y: null, width: 0, height: 0, maximized: false },
   schedule: { enabled: true, intervalMinutes: 30 },
   gameCheck: {
     enabled: true,

@@ -9,7 +9,8 @@ async function loadConfig() {
   $('lolicon-size').value = cfg.lolicon.size;
   $('lolicon-r18').value = cfg.lolicon.r18;
   $('ai-prompt').value = cfg.ai.prompt;
-  $('ai-model').value = cfg.ai.model;
+  // #ai-model 的 option 值是 'doubao' / 'svc:模型名',直接赋 cfg.ai.model(裸模型名)永远匹配不上,
+  // 会把下拉打成空值。这个下拉统一由 refreshImageEngineOptions() 按引擎+模型回填,这里不碰。
   $('ai-size').value = cfg.ai.size;
   $('hist-keep').value = cfg.history.keepCount;
   $('game-procs').value = cfg.gameCheck.processes.join('\n');
@@ -17,14 +18,7 @@ async function loadConfig() {
   $('seg-lolicon').classList.toggle('on', cfg.source !== 'ai');
   $('seg-ai').classList.toggle('on', cfg.source === 'ai');
   initAiMode(cfg.ai.randomMode || 'any');
-  setSwitch('sw-preview', !!(cfg.ai && cfg.ai.previewMode));
-  // 阶段4:本会话若有未确认的 pending(如切换页面/刷新界面),恢复预览卡片
-  try {
-    const pg = await api.aiPendingGet();
-    if (pg && pg.ok && pg.exists) {
-      await showPreview({ taskId: pg.taskId, imageVersion: pg.imageVersion, bytes: pg.bytes, prompt: pg.prompt, engine: pg.engine, pendingPath: pg.pendingPath });
-    }
-  } catch {}
+  // 生成预览开关与 pending 恢复已随「生成直接进图库」下线,这里不再回填
   $('sw-autorun').classList.toggle('on', await api.getAutoRun());
   setSwitch('sw-proxy', cfg.proxy && cfg.proxy.enabled);
   if (!$('proxy-url').value) $('proxy-url').value = (cfg.proxy && cfg.proxy.url) || '';

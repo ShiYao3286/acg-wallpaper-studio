@@ -74,5 +74,3 @@ async function refreshOldTaskBadge() {
   if (!el) return;
   el.textContent = st.exists ? (st.enabled ? '⚠ 旧任务启用中(每30分钟会换图)' : '已停用 ✓') : '未找到(可能已删除)';
 }
-
-const _origLoadConfig = loadConfig;
